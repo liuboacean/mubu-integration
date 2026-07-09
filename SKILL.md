@@ -43,213 +43,30 @@ export MUBU_PASSWORD="your_password"      # 幕布账号密码
 
 ## 使用说明
 
-### 1. 认证流程
+### 1. 使用 MubuClient
+
+现代实现以 `MubuClient` 类为核心（位于 `scripts/mubu_api.py`）。登录响应与文档数据均为**扁平结构**：Token、用户 id / name 直接位于 `data` 下（不再有 `data["user"]` 嵌套），取值请用 `data["id"]` 而非旧版的 `data["user"]["id"]`。
 
 ```python
-import requests
-import json
+from mubu_api import MubuClient
 
-def login(phone, password):
-    """幕布登录获取 Token"""
-    url = "https://api2.mubu.com/v3/api/user/phone_login"
-    headers = {
-        "Content-Type": "application/json;charset=UTF-8",
-        "Origin": "https://mubu.com",
-        "Referer": "https://mubu.com/",
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
-    }
-    data = {
-        "phone": phone,
-        "password": password,
-        "callbackType": 0
-    }
-    response = requests.post(url, headers=headers, json=data)
-    result = response.json()
-    if result.get("code") == 0:
-        return {
-            "token": result["data"]["token"],
-            "user_id": result["data"]["user"]["id"],
-            "username": result["data"]["user"]["name"]
-        }
-    else:
-        raise Exception(f"登录失败: {result.get('msg')}")
-```
+# 凭据来自环境变量 MUBU_PHONE / MUBU_PASSWORD，或 ~/.workbuddy/.env.mubu
+client = MubuClient()
+result = client.login()  # 登录并本地缓存 Token
 
-### 2. 创建文件夹
+# result == {"token": data["token"], "user_id": data["id"], "username": data["name"]}
+print("user_id:", result["user_id"])   # 对应登录响应 data["id"]
+print("name:", result["username"])      # 对应登录响应 data["name"]
 
-```python
-def create_folder(token, name, parent_id="0"):
-    """创建文件夹
-    
-    Args:
-        token: JWT Token
-        name: 文件夹名称
-        parent_id: 父文件夹ID，根目录为 "0"
-    
-    Returns:
-        新创建的文件夹ID
-    """
-    url = "https://api2.mubu.com/v3/api/list/create_folder"
-    headers = {
-        "Content-Type": "application/json;charset=UTF-8",
-        "jwt-token": token,
-        "Origin": "https://mubu.com",
-        "Referer": "https://mubu.com/"
-    }
-    data = {
-        "folderId": parent_id,
-        "name": name
-    }
-    response = requests.post(url, headers=headers, json=data)
-    result = response.json()
-    if result.get("code") == 0:
-        return result["data"]["folder"]["id"]
-    else:
-        raise Exception(f"创建文件夹失败: {result.get('msg')}")
-```
+# 创建文件夹 / 文档，直接返回 id
+folder_id = client.create_folder("项目", parent_id="0")
+doc_id = client.create_doc("大纲", folder_id=folder_id)
 
-### 3. 创建文档
+# 获取文档（扁平 data 层，直接含 node 结构）
+doc = client.get_doc(doc_id)
 
-```python
-def create_doc(token, name, folder_id="0", content=""):
-    """创建文档
-    
-    Args:
-        token: JWT Token
-        name: 文档名称
-        folder_id: 所在文件夹ID，根目录为 "0"
-        content: 文档初始内容（大纲结构）
-    
-    Returns:
-        新创建的文档ID
-    """
-    url = "https://api2.mubu.com/v3/api/list/create_doc"
-    headers = {
-        "Content-Type": "application/json;charset=UTF-8",
-        "jwt-token": token,
-        "Origin": "https://mubu.com",
-        "Referer": "https://mubu.com/"
-    }
-    data = {
-        "folderId": folder_id,
-        "name": name,
-        "content": content
-    }
-    response = requests.post(url, headers=headers, json=data)
-    result = response.json()
-    if result.get("code") == 0:
-        return result["data"]["doc"]["id"]
-    else:
-        raise Exception(f"创建文档失败: {result.get('msg')}")
-```
-
-### 4. 获取文档列表
-
-```python
-def get_list(token, folder_id="0"):
-    """获取文件夹下的文档列表
-    
-    Args:
-        token: JWT Token
-        folder_id: 文件夹ID，根目录为 "0"
-    
-    Returns:
-        文档和文件夹列表
-    """
-    url = "https://api2.mubu.com/v3/api/list/get"
-    headers = {
-        "jwt-token": token,
-        "Origin": "https://mubu.com",
-        "Referer": "https://mubu.com/"
-    }
-    response = requests.post(url, headers=headers, json={"folderId": folder_id})
-    result = response.json()
-    if result.get("code") == 0:
-        return result["data"]
-    else:
-        raise Exception(f"获取列表失败: {result.get('msg')}")
-```
-
-### 5. 获取文档内容
-
-```python
-def get_doc(token, doc_id):
-    """获取文档详细内容
-    
-    Args:
-        token: JWT Token
-        doc_id: 文档ID
-    
-    Returns:
-        文档详细内容（包含大纲结构）
-    """
-    url = "https://api2.mubu.com/v3/api/doc/get"
-    headers = {
-        "jwt-token": token,
-        "Origin": "https://mubu.com",
-        "Referer": "https://mubu.com/"
-    }
-    response = requests.post(url, headers=headers, json={"id": doc_id})
-    result = response.json()
-    if result.get("code") == 0:
-        return result["data"]
-    else:
-        raise Exception(f"获取文档失败: {result.get('msg')}")
-```
-
-### 6. 保存文档
-
-```python
-def save_doc(token, doc_id, content, name=None):
-    """保存/更新文档内容
-    
-    Args:
-        token: JWT Token
-        doc_id: 文档ID
-        content: 文档内容（JSON格式的大纲结构）
-        name: 可选，更新文档名称
-    """
-    url = "https://api2.mubu.com/v3/api/doc/save"
-    headers = {
-        "Content-Type": "application/json;charset=UTF-8",
-        "jwt-token": token,
-        "Origin": "https://mubu.com",
-        "Referer": "https://mubu.com/"
-    }
-    data = {
-        "id": doc_id,
-        "content": content
-    }
-    if name:
-        data["name"] = name
-    response = requests.post(url, headers=headers, json=data)
-    result = response.json()
-    if result.get("code") != 0:
-        raise Exception(f"保存文档失败: {result.get('msg')}")
-```
-
-### 7. 删除文档/文件夹
-
-```python
-def delete_item(token, item_id):
-    """删除文档或文件夹
-    
-    Args:
-        token: JWT Token
-        item_id: 文档或文件夹ID
-    """
-    url = "https://api2.mubu.com/v3/api/list/delete"
-    headers = {
-        "Content-Type": "application/json;charset=UTF-8",
-        "jwt-token": token,
-        "Origin": "https://mubu.com",
-        "Referer": "https://mubu.com/"
-    }
-    data = {"id": item_id}
-    response = requests.post(url, headers=headers, json=data)
-    result = response.json()
-    if result.get("code") != 0:
-        raise Exception(f"删除失败: {result.get('msg')}")
+# 按名称本地搜索（从根递归遍历所有子文件夹，大小写不敏感）
+results = client.search("关键词")
 ```
 
 ---

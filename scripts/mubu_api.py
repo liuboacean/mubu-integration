@@ -26,7 +26,14 @@ import time
 import argparse
 import requests
 from pathlib import Path
-from typing import Optional, Dict, List, Any, Tuple
+from typing import Optional, Dict, List, Any, Tuple, Generator
+from contextlib import contextmanager
+
+# fcntl 仅 Unix 可用（macOS / Linux / CI ubuntu）；Windows 等无 fcntl 平台降级为无锁
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - 非 Unix 平台
+    fcntl = None
 
 # API 基础配置
 BASE_URL = "https://api2.mubu.com/v3/api"
@@ -43,16 +50,17 @@ DEFAULT_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 }
 
-# 接口路径常量：统一在此维护，便于后续集中修改
+# 接口路径常量：统一在此维护，便于后续集中修改。
+# 每个端点为 (HTTP 方法, 路径) 二元组；调用处用 self._request(*ENDPOINTS["key"], ...) 解包。
 ENDPOINTS = {
-    "login": "/user/phone_login",
-    "list": "/list/get",
-    "create_folder": "/list/create_folder",
-    "create_doc": "/list/create_doc",
-    "get_doc": "/doc/get",
-    "save_doc": "/doc/save",
-    "delete": "/list/delete",
-    "move": "/list/move",
+    "login": ("POST", "/user/phone_login"),
+    "list": ("POST", "/list/get"),
+    "create_folder": ("POST", "/list/create_folder"),
+    "create_doc": ("POST", "/list/create_doc"),
+    "get_doc": ("POST", "/doc/get"),
+    "save_doc": ("POST", "/doc/save"),
+    "delete": ("POST", "/list/delete"),
+    "move": ("POST", "/list/move"),
 }
 
 # 网络重试配置（T5）
@@ -66,6 +74,14 @@ NETWORK_BACKOFF = (1, 2)
 TOKEN_FILE_MODE = 0o600
 # 异常 body 截断长度，避免超大响应体污染错误信息
 BODY_TRUNCATE = 200
+
+# 本地搜索（search）限制配置（M4 T2）
+# 根文件夹 depth=0，默认 3 即最多展开 4 层
+MAX_SEARCH_DEPTH = 3
+# 单节点子项上限（每个文件夹最多取前 N 个 docs / folders）
+MAX_SEARCH_LIMIT = 50
+# 整个搜索的 HTTP 请求数硬上限（get_list 调用次数）
+MAX_SEARCH_REQUESTS = 200
 
 
 class MubuError(Exception):
@@ -147,10 +163,28 @@ class MubuClient:
                 pass
         return False
 
+    @contextmanager
+    def _token_file_lock(self) -> Generator[None, None, None]:
+        """跨进程文件锁（Unix 专用）：保护 Token 原子写，避免并发写损坏。
+
+        仅 macOS / Linux / CI(ubuntu) 可用；Windows 等无 fcntl 平台直接降级为无锁。
+        """
+        lock_path = os.path.expanduser("~/.mubu_token.lock")
+        if fcntl is None:
+            yield
+            return
+        with open(lock_path, "w") as lf:
+            fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
+
     def _save_token(self) -> None:
         """原子写 Token 到本地：先写临时文件再 rename，避免中途崩溃留残缺文件。
 
-        T5：rename 之后追加 chmod 0o600，确保 Token 文件仅属主可读写。
+        M2 的 T5：rename 之后追加 chmod 0o600，确保 Token 文件仅属主可读写。
+        M4 的 T3：原子写整体用跨进程文件锁包裹，避免多进程并发写损坏 Token 文件。
         """
         self.expires_at = time.time() + 7200  # 2 小时过期
         data = {
@@ -159,11 +193,12 @@ class MubuClient:
             "username": self.username,
             "expires_at": self.expires_at
         }
-        tmp = TOKEN_FILE.parent / (TOKEN_FILE.name + ".tmp")
-        tmp.write_text(json.dumps(data, indent=2))
-        os.rename(tmp, TOKEN_FILE)
-        # T5：设置权限 600，防止其它用户读取 Token
-        os.chmod(TOKEN_FILE, TOKEN_FILE_MODE)
+        with self._token_file_lock():
+            tmp = TOKEN_FILE.parent / (TOKEN_FILE.name + ".tmp")
+            tmp.write_text(json.dumps(data, indent=2))
+            os.rename(tmp, TOKEN_FILE)
+            # M2 的 T5：设置权限 600，防止其它用户读取 Token
+            os.chmod(TOKEN_FILE, TOKEN_FILE_MODE)
 
     def _get_headers(self) -> Dict[str, str]:
         """获取带认证的请求头"""
@@ -247,7 +282,7 @@ class MubuClient:
 
         # 理论不可达：兜底抛错，避免漏掉 last_err
         raise MubuError(
-            f"网络请求失败（已耗尽重试）: {last_err}",
+            f"网络请求失败（已耗尽重试）: {last_err or '未知错误'}",
             status_code=None,
         )
 
@@ -315,7 +350,7 @@ class MubuClient:
         if not self.phone or not self.password:
             raise MubuError("请设置 MUBU_PHONE 和 MUBU_PASSWORD 环境变量，或传入参数")
 
-        data = self._request("POST", ENDPOINTS["login"], auth=False, max_retries=0, json={
+        data = self._request(*ENDPOINTS["login"], auth=False, max_retries=0, json={
             "phone": self.phone,
             "password": self.password,
             "callbackType": 0
@@ -341,13 +376,13 @@ class MubuClient:
     def get_list(self, folder_id: str = "0") -> List[Dict]:
         """获取文件夹下的文档和子文件夹列表"""
         self.ensure_login()
-        data = self._request("POST", ENDPOINTS["list"], json={"folderId": folder_id})
+        data = self._request(*ENDPOINTS["list"], json={"folderId": folder_id})
         return data
 
     def create_folder(self, name: str, parent_id: str = "0") -> str:
         """创建文件夹"""
         self.ensure_login()
-        data = self._request("POST", ENDPOINTS["create_folder"], json={
+        data = self._request(*ENDPOINTS["create_folder"], json={
             "folderId": parent_id,
             "name": name
         })
@@ -356,7 +391,7 @@ class MubuClient:
     def create_doc(self, name: str, folder_id: str = "0", content: str = "") -> str:
         """创建文档"""
         self.ensure_login()
-        data = self._request("POST", ENDPOINTS["create_doc"], json={
+        data = self._request(*ENDPOINTS["create_doc"], json={
             "folderId": folder_id,
             "name": name,
             "content": content
@@ -366,7 +401,7 @@ class MubuClient:
     def get_doc(self, doc_id: str) -> Dict:
         """获取文档内容"""
         self.ensure_login()
-        return self._request("POST", ENDPOINTS["get_doc"], json={"id": doc_id})
+        return self._request(*ENDPOINTS["get_doc"], json={"id": doc_id})
 
     def save_doc(self, doc_id: str, content: str, name: Optional[str] = None) -> None:
         """保存文档"""
@@ -374,30 +409,40 @@ class MubuClient:
         data = {"id": doc_id, "content": content}
         if name:
             data["name"] = name
-        self._request("POST", ENDPOINTS["save_doc"], json=data)
+        self._request(*ENDPOINTS["save_doc"], json=data)
 
     def delete(self, item_id: str) -> None:
         """删除文档或文件夹"""
         self.ensure_login()
-        self._request("POST", ENDPOINTS["delete"], json={"id": item_id})
+        self._request(*ENDPOINTS["delete"], json={"id": item_id})
 
     def move(self, item_id: str, target_folder_id: str) -> None:
         """移动文档到其他文件夹"""
         self.ensure_login()
-        self._request("POST", ENDPOINTS["move"], json={
+        self._request(*ENDPOINTS["move"], json={
             "id": item_id,
             "folderId": target_folder_id
         })
 
-    def search(self, keyword: str, root_folder_id: str = "0") -> List[Dict]:
+    def search(self, keyword: str, root_folder_id: str = "0",
+               max_depth: int = MAX_SEARCH_DEPTH, limit: int = MAX_SEARCH_LIMIT,
+               max_requests: int = MAX_SEARCH_REQUESTS) -> List[Dict]:
         """本地递归搜索：名称包含关键字的文档与文件夹（T6）。
 
         mubu 无公开 /search 端点，本期采用本地过滤：从根文件夹开始递归遍历
         所有子文件夹，收集 name 包含 keyword（大小写不敏感）的条目。
 
+        限制（M4 T2，全部静默截断：超出即停止，不抛异常、不打断返回）：
+        - max_depth: 递归深度上限（根 depth=0，默认 3 即最多展开 4 层）
+        - limit: 单节点子项上限（每个文件夹最多取前 N 个 docs / folders）
+        - max_requests: 整个搜索的 HTTP 请求数硬上限（get_list 调用次数）
+
         Args:
             keyword: 搜索关键字（大小写不敏感）
             root_folder_id: 遍历起点文件夹 ID，默认 "0"（根）
+            max_depth: 递归深度上限
+            limit: 单文件夹子项上限
+            max_requests: 搜索总请求数硬上限
 
         Returns:
             匹配项列表，每项含 id / name / type（"doc" | "folder"）/ path（从根起的路径）
@@ -405,17 +450,28 @@ class MubuClient:
         keyword_lower = (keyword or "").lower()
         results: List[Dict] = []
 
-        def walk(folder_id: str, path: str) -> None:
-            """递归遍历 folder_id，将命中项追加到 results。"""
+        # 整个搜索的 HTTP 请求计数（用于 max_requests 静默截断）
+        req_count = [0]
+
+        def walk(folder_id: str, path: str, depth: int) -> None:
+            """递归遍历 folder_id，将命中项追加到 results。
+
+            命中三项限制时静默停止：请求数达上限、递归深度达上限、单节点子项达上限。
+            """
+            # 请求数硬上限：达到即停止遍历，避免超大账号下无限请求
+            if req_count[0] >= max_requests:
+                return
             try:
                 data = self.get_list(folder_id)
             except MubuError as e:
                 # 单个文件夹拉取失败不阻断整体遍历
                 print(f"警告: 遍历文件夹 {folder_id} 失败: {e}", file=sys.stderr)
                 return
+            req_count[0] += 1
 
-            folders = data.get("folders", []) or []
-            docs = data.get("docs", []) or []
+            # 单节点子项上限：静默截断，只取前 limit 个
+            folders = (data.get("folders", []) or [])[:limit]
+            docs = (data.get("docs", []) or [])[:limit]
 
             # 文档匹配
             for d in docs:
@@ -428,7 +484,7 @@ class MubuClient:
                         "path": path,
                     })
 
-            # 文件夹匹配 + 递归子文件夹
+            # 文件夹匹配 + 递归子文件夹（受 max_depth 限制）
             for f in folders:
                 name = f.get("name", "")
                 if keyword_lower and keyword_lower in name.lower():
@@ -438,11 +494,13 @@ class MubuClient:
                         "type": "folder",
                         "path": path,
                     })
-                # 递归进入子文件夹，路径追加当前文件夹名
-                child_path = f"{path}/{name}" if path else name
-                walk(f.get("id"), child_path)
+                # 递归进入子文件夹，路径追加当前文件夹名；
+                # depth 已达上限则不再深入，避免无限展开
+                if depth < max_depth:
+                    child_path = f"{path}/{name}" if path else name
+                    walk(f.get("id"), child_path, depth + 1)
 
-        walk(root_folder_id, "")
+        walk(root_folder_id, "", 0)
         return results
 
 
@@ -716,9 +774,13 @@ def main() -> None:
     move_parser.add_argument("item_id", help="文档ID")
     move_parser.add_argument("--target", required=True, help="目标文件夹ID")
 
-    # 搜索（T6）
+    # 搜索（T6，M4 T2 增加 --max-depth / --limit）
     search_parser = subparsers.add_parser("search", help="本地搜索文档/文件夹（按名称）")
     search_parser.add_argument("keyword", help="搜索关键字（大小写不敏感）")
+    search_parser.add_argument("--max-depth", type=int, default=MAX_SEARCH_DEPTH,
+                               help="递归深度上限（根 depth=0，默认 3 即最多展开 4 层）")
+    search_parser.add_argument("--limit", type=int, default=MAX_SEARCH_LIMIT,
+                               help="单文件夹子项上限（默认 50）")
     search_parser.add_argument("--json", action="store_true", help="JSON 格式输出")
 
     args = parser.parse_args()
@@ -784,7 +846,11 @@ def main() -> None:
             print(f"移动成功: {args.item_id} -> {args.target}")
 
         elif args.command == "search":
-            results = client.search(args.keyword)
+            results = client.search(
+                args.keyword,
+                max_depth=args.max_depth,
+                limit=args.limit,
+            )
             if args.json:
                 print(json.dumps(results, indent=2, ensure_ascii=False))
             else:
