@@ -114,28 +114,44 @@ for r in results:
 import os
 import time
 import json
+import tempfile
 
 TOKEN_FILE = os.path.expanduser("~/.mubu_token")
 
 def save_token(token_data):
-    """保存 Token 到本地"""
+    """原子写 + 仅属主可读写：避免中途崩溃留下残缺文件，并防止其它用户读取。"""
+    token_data = dict(token_data)
     token_data["expires_at"] = time.time() + 7200  # 2小时后过期
-    with open(TOKEN_FILE, "w") as f:
-        json.dump(token_data, f)
+    # 注：真实 scripts/mubu_api.py 的 _save_token 还会用跨进程 fcntl.flock
+    # advisory 锁包裹整段写（M4 已做成跨平台安全：无 fcntl 平台降级为无锁）；
+    # 此处省略锁，聚焦写盘逻辑。
+    dir_name = os.path.dirname(TOKEN_FILE) or "."
+    fd, tmp = tempfile.mkstemp(dir=dir_name, prefix=".mubu_token.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(token_data, f)
+        os.chmod(tmp, 0o600)        # 仅属主可读写
+        os.replace(tmp, TOKEN_FILE) # 原子重命名，避免残缺文件
+    except Exception:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        raise
 
 def load_token():
-    """从本地加载 Token"""
-    if os.path.exists(TOKEN_FILE):
-        with open(TOKEN_FILE, "r") as f:
-            return json.load(f)
-    return None
-
-def is_token_valid(token_data):
-    """检查 Token 是否有效"""
-    if not token_data:
-        return False
-    return time.time() < token_data.get("expires_at", 0)
+    """从本地加载未过期的 Token；已过期或损坏则返回 None。"""
+    if not os.path.exists(TOKEN_FILE):
+        return None
+    try:
+        with open(TOKEN_FILE) as f:
+            data = json.load(f)
+    except Exception:
+        return None
+    if time.time() >= data.get("expires_at", 0):  # 已过期视为无效
+        return None
+    return data
 ```
+
+说明：原示例中朴素的 `is_token_valid` 已移除——其职责（"是否过期"）已并入 `load_token`，仅返回未过期的 token。真实实现 `scripts/mubu_api.py` 的 `_save_token` 还包含跨进程 `fcntl.flock` 锁与统一的 `TOKEN_FILE_MODE` 权限管理，此处不再重复。
 
 ---
 

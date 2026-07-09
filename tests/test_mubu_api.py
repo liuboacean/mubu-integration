@@ -706,6 +706,27 @@ class TestSearch:
         assert "📁" in out
         assert "📄" in out
 
+    @responses.activate
+    def test_search_global_limit_enforced(self, isolated_client):
+        # 根文件夹返回 5 个全部命中关键字 "x" 的 doc（x0..x4）。
+        # 若全局上限（scripts/mubu_api.py 的 walk() 内 len(results) >= limit 早返回）
+        # 未生效，search 会收集到全部 5 项；本测试验证其在 limit=2 时仅收集前 2 项
+        # 并早返回（证明上限被强制执行，属"真在测"——移除上限逻辑此处会失败）。
+        responses.add(
+            responses.POST, f"{BASE_URL}/list/get",
+            json={"code": 0, "data": {
+                "folders": [],
+                "docs": [{"id": f"d{i}", "name": f"x{i}"} for i in range(5)],
+            }}, status=200,
+            match=[matchers.json_params_matcher({"folderId": "0"})],
+        )
+
+        results = isolated_client.search("x", limit=2)
+        # 上限生效：只收集到 2 项（移除上限逻辑此处会变成 5 项而失败）
+        assert len(results) == 2
+        # 恰好是前 2 个（x0、x1），随后早返回，x2..x4 不会被收集
+        assert {r["name"] for r in results} == {"x0", "x1"}
+
 
 # --------------------------------------------------------------------------- #
 # 13. M2 T5 — format_list 仅使用 docs（移除 documents 兜底）

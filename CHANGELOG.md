@@ -30,3 +30,5 @@
 - P2-6：_save_token 增加 fcntl.flock 跨进程 advisory 锁（已加固为跨平台安全：try/except ImportError，无 fcntl 平台如 Windows 降级为无锁）
 - P1-4 / P2-7：补充网络层（5xx 混合降级、ConnectionError）与 .env 回归测试
 - P0-1：SKILL.md 清理旧版独立函数，改为指向 MubuClient 的引用与示例
+- T2 收尾：新增 `test_search_global_limit_enforced`，真实验证 `search()` 全局 `limit` 上限被强制执行（破坏性验证：移除上限逻辑则用例失败）
+- SKILL.md「Token 管理建议」示例修正：朴素 `open()+json.dump` 改为原子写（tempfile + os.replace）+ chmod 0o600，并注明真实 `_save_token` 还含跨进程 fcntl 锁；删除误导性的 `is_token_valid`
