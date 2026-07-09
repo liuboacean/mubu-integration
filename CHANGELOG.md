@@ -27,6 +27,6 @@
 - P1-5：ENDPOINTS 元组化 (method, path)，消除调用点硬编码 "POST"
 - P0-2：search() 增加 max_depth / limit / max_requests 上限；CLI 透传 --max-depth / --limit
 - P1-3：_http_request 兜底消息避免渲染字面 : None
-- P2-6：_save_token 增加 fcntl.flock 跨进程 advisory 锁
+- P2-6：_save_token 增加 fcntl.flock 跨进程 advisory 锁（已加固为跨平台安全：try/except ImportError，无 fcntl 平台如 Windows 降级为无锁）
 - P1-4 / P2-7：补充网络层（5xx 混合降级、ConnectionError）与 .env 回归测试
 - P0-1：SKILL.md 清理旧版独立函数，改为指向 MubuClient 的引用与示例

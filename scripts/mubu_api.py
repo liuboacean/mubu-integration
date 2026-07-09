@@ -27,10 +27,13 @@ import argparse
 import requests
 from pathlib import Path
 from contextlib import contextmanager
-import fcntl
+try:
+    import fcntl
+except ImportError:
+    fcntl = None  # 无 fcntl 平台（如 Windows）：锁降级为无操作
 from typing import Optional, Dict, List, Any, Tuple, Iterator
 
-# fcntl 仅 Unix 可用（fcntl.flock advisory lock）；非 Unix 平台不可用，记录备查（P2-6）
+# fcntl 跨进程 advisory 锁：Unix 用 fcntl.flock；无 fcntl 平台（Windows 等）降级为无操作（P2-6）
 # API 基础配置
 BASE_URL = "https://api2.mubu.com/v3/api"
 TOKEN_FILE = Path.home() / ".mubu_token"
@@ -74,20 +77,24 @@ BODY_TRUNCATE = 200
 # 本地搜索（search）限制配置（M4 T2）
 # 根文件夹 depth=0，默认 3 即最多展开 4 层
 MAX_SEARCH_DEPTH = 3
-# 单节点子项上限（每个文件夹最多取前 N 个 docs / folders）
+# 返回结果总数上限（单轮 search 命中条目硬上限，达到即静默截断）
 MAX_SEARCH_LIMIT = 50
 # 整个搜索的 HTTP 请求数硬上限（get_list 调用次数）
 MAX_SEARCH_REQUESTS = 200
 
 
-# Token 文件跨进程 advisory 锁（Unix only，fcntl.flock；非 Unix 不可用，记录备查）（P2-6）
+# Token 文件跨进程 advisory 锁（P2-6）：Unix 用 fcntl.flock；无 fcntl 平台降级为无操作
 @contextmanager
 def _token_file_lock() -> Iterator[None]:
     """用 fcntl.flock 对 Token 文件加排他锁，避免多进程并发写损坏文件。
 
     锁文件为 TOKEN_FILE 同目录下的 ``<name>.lock``；进入临界区前 flock(LOCK_EX)，
     退出（含异常）时 flock(LOCK_UN)，异常路径保证锁释放。
+    无 fcntl 平台（如 Windows）：跳过加锁，仅单进程场景下依赖原子 rename 保证完整性。
     """
+    if fcntl is None:
+        yield          # 无 fcntl：跳过加锁，仅单进程场景（原子 rename 仍保证完整性）
+        return
     lock_path = TOKEN_FILE.parent / (TOKEN_FILE.name + ".lock")
     f = open(lock_path, "a")
     try:
