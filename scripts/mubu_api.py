@@ -26,7 +26,7 @@ import time
 import argparse
 import requests
 from pathlib import Path
-from typing import Optional, Dict, List, Any
+from typing import Optional, Dict, List, Any, Tuple
 
 # API 基础配置
 BASE_URL = "https://api2.mubu.com/v3/api"
@@ -77,7 +77,7 @@ class MubuError(Exception):
     请勿在此重复定义完整字段以外的内容。
     """
 
-    def __init__(self, msg: str, status_code: int = None, body: Any = None):
+    def __init__(self, msg: str, status_code: Optional[int] = None, body: Any = None) -> None:
         super().__init__(msg)
         self.msg = msg
         self.status_code = status_code
@@ -90,7 +90,7 @@ class MubuError(Exception):
 class MubuClient:
     """幕布 API 客户端"""
 
-    def __init__(self, phone: str = None, password: str = None):
+    def __init__(self, phone: Optional[str] = None, password: Optional[str] = None) -> None:
         # T5：在读取 phone/password 之前，先尝试从 .env 文件补全凭据
         self._load_env_file()
         self.phone = phone or os.getenv("MUBU_PHONE")
@@ -101,7 +101,7 @@ class MubuClient:
         self.expires_at = 0  # Token 过期时间戳（秒）
         self._load_token()
 
-    def _load_env_file(self, path: Path = None) -> None:
+    def _load_env_file(self, path: Optional[Path] = None) -> None:
         """从 .env 文件加载凭据（仅当环境变量未设置时补全）。
 
         默认读取 ENV_FILE（~/.workbuddy/.env.mubu）；文件不存在则静默跳过。
@@ -131,7 +131,7 @@ class MubuClient:
             # 加载失败不影响主流程，后续 login 会提示设置环境变量
             pass
 
-    def _load_token(self):
+    def _load_token(self) -> bool:
         """从本地加载 Token（未过期才生效）"""
         if TOKEN_FILE.exists():
             try:
@@ -147,7 +147,7 @@ class MubuClient:
                 pass
         return False
 
-    def _save_token(self):
+    def _save_token(self) -> None:
         """原子写 Token 到本地：先写临时文件再 rename，避免中途崩溃留残缺文件。
 
         T5：rename 之后追加 chmod 0o600，确保 Token 文件仅属主可读写。
@@ -183,7 +183,7 @@ class MubuClient:
         if not self.token or time.time() > self.expires_at - 300 - leeway:
             self.login()
 
-    def _is_auth_error(self, result: Dict, response) -> bool:
+    def _is_auth_error(self, result: Dict[str, Any], response: "requests.Response") -> bool:
         """判断是否为鉴权失效错误。
 
         仅当 HTTP 401，或响应 code 表示登录失效（含相关关键字）时返回 True。
@@ -252,7 +252,7 @@ class MubuClient:
         )
 
     def _request(self, method: str, endpoint: str, max_retries: int = 1,
-                 auth: bool = True, **kwargs) -> Dict:
+                 auth: bool = True, **kwargs: Any) -> Dict:
         """发送 HTTP 请求，统一处理鉴权与重试。
 
         分层说明（T5 增强）：
@@ -333,7 +333,7 @@ class MubuClient:
             "username": self.username
         }
 
-    def ensure_login(self):
+    def ensure_login(self) -> None:
         """确保已登录（兼容旧调用；_request 内已统一处理）"""
         if not self.token:
             self.login()
@@ -368,7 +368,7 @@ class MubuClient:
         self.ensure_login()
         return self._request("POST", ENDPOINTS["get_doc"], json={"id": doc_id})
 
-    def save_doc(self, doc_id: str, content: str, name: str = None):
+    def save_doc(self, doc_id: str, content: str, name: Optional[str] = None) -> None:
         """保存文档"""
         self.ensure_login()
         data = {"id": doc_id, "content": content}
@@ -376,12 +376,12 @@ class MubuClient:
             data["name"] = name
         self._request("POST", ENDPOINTS["save_doc"], json=data)
 
-    def delete(self, item_id: str):
+    def delete(self, item_id: str) -> None:
         """删除文档或文件夹"""
         self.ensure_login()
         self._request("POST", ENDPOINTS["delete"], json={"id": item_id})
 
-    def move(self, item_id: str, target_folder_id: str):
+    def move(self, item_id: str, target_folder_id: str) -> None:
         """移动文档到其他文件夹"""
         self.ensure_login()
         self._request("POST", ENDPOINTS["move"], json={
@@ -446,7 +446,7 @@ class MubuClient:
         return results
 
 
-def doc_to_markdown(node: dict, level: int = 0) -> str:
+def doc_to_markdown(node: Dict[str, Any], level: int = 0) -> str:
     """将节点（及其子树）递归渲染为 Markdown 列表片段。
 
     子节点使用 '- ' 列表项，缩进 = 2 * level；含 checked 渲染为 '- [x]'/'- [ ]'；
@@ -482,7 +482,7 @@ def doc_to_markdown(node: dict, level: int = 0) -> str:
     return "\n".join(lines)
 
 
-def export_markdown(doc: dict) -> str:
+def export_markdown(doc: Dict[str, Any]) -> str:
     """将文档 data 层转换为 Markdown 文本。
 
     Args:
@@ -505,7 +505,7 @@ def export_markdown(doc: dict) -> str:
     return "\n".join(lines)
 
 
-def markdown_to_doc(md: str) -> dict:
+def markdown_to_doc(md: str) -> Dict[str, Any]:
     r"""将 Markdown 文本解析为幕布文档结构。
 
     解析规则（按行）：
@@ -558,7 +558,7 @@ def markdown_to_doc(md: str) -> dict:
         return {"node": root_node}
 
     # 用栈维护 (depth, node)；栈底为 root
-    stack: List[tuple] = [(0, root_node)]
+    stack: List[Tuple[int, Dict[str, Any]]] = [(0, root_node)]
 
     for line in lines:
         if not line.strip():
@@ -669,7 +669,7 @@ def format_search(results: List[Dict]) -> str:
     return "\n".join(lines)
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(description="幕布 API 命令行工具")
     subparsers = parser.add_subparsers(dest="command", help="可用命令")
 
