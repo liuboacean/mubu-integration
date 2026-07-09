@@ -3,7 +3,7 @@
 [![GitHub stars](https://img.shields.io/github/stars/liuboacean/mubu-integration?style=social)](https://github.com/liuboacean/mubu-integration/stargazers)
 [![GitHub forks](https://img.shields.io/github/forks/liuboacean/mubu-integration?style=social)](https://github.com/liuboacean/mubu-integration/network/members)
 [![MIT License](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![CI](https://github.com/liuboacean/mubu-integration/actions/workflows/test.yml/badge.svg)](https://github.com/liuboacean/mubu-integration/actions/workflows/test.yml)
+[![CI](https://img.shields.io/github/actions/workflow/status/liuboacean/mubu-integration/test.yml?branch=main)](https://github.com/liuboacean/mubu-integration/actions/workflows/test.yml)
 
 > 一个 WorkBuddy Skill，通过命令行管理幕布（Mubu）文档与文件夹，并支持 Markdown 大纲的双向往返。
 
