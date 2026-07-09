@@ -522,6 +522,37 @@ class TestNetworkRetry:
         assert isinstance(e.body, str) and len(e.body) == 200  # 截断
         assert mreq.call_count == 3  # 1 首发 + 2 次重试
 
+    @mock.patch("requests.request")
+    def test_5xx_mixed_degrade_then_success(self, mreq):
+        c = MubuClient(phone="p", password="w"); c.token = "t"
+        seq = [502, 503, 200]
+        def side(*a, **k):
+            s = seq.pop(0)
+            r = mock.Mock(); r.status_code = s; r.text = "x" * 10
+            r.json.return_value = {"code": 0, "data": {}} if s == 200 else {"code": 1}
+            return r
+        mreq.side_effect = side
+        with mock.patch("time.sleep"):
+            out = c._http_request("POST", "http://x/api", {"h": "1"})
+        assert out.status_code == 200
+        assert mreq.call_count == 3
+
+    @mock.patch("requests.request")
+    def test_connection_error_retries_then_success(self, mreq):
+        c = MubuClient(phone="p", password="w"); c.token = "t"
+        resp = mock.Mock(); resp.status_code = 200; resp.json.return_value = {"code": 0, "data": {}}
+        calls = {"n": 0}
+        def side(*a, **k):
+            calls["n"] += 1
+            if calls["n"] <= 2:
+                raise requests.exceptions.ConnectionError("conn reset")
+            return resp
+        mreq.side_effect = side
+        with mock.patch("time.sleep"):
+            out = c._http_request("POST", "http://x/api", {"h": "1"})
+        assert out is resp
+        assert calls["n"] == 3
+
 
 # --------------------------------------------------------------------------- #
 # 9. M2 T5 — 401 重试与网络重试互不干扰（关键回归）
@@ -593,6 +624,16 @@ class TestEnvFileLoading:
         assert c.password == "y"
         # 非目标键不被注入环境变量
         assert "FOO" not in mubu_api.os.environ
+
+    def test_env_key_stripped(self, tmp_path, monkeypatch):
+        """回归：.env 键名两侧空白需被 key.strip() 去除（M2 第 125 行）。"""
+        monkeypatch.delenv("MUBU_PHONE", raising=False)
+        env = tmp_path / ".env.mubu"
+        env.write_text('  MUBU_PHONE = 13800000000  \n', encoding="utf-8")
+        with mock.patch.object(mubu_api, "ENV_FILE", env):
+            c = MubuClient(phone="p", password="w")
+        c._load_env_file(path=env)
+        assert os.getenv("MUBU_PHONE") == "13800000000"
 
 
 # --------------------------------------------------------------------------- #
@@ -691,71 +732,3 @@ class TestFormatListDocsOnly:
 
 
 # --------------------------------------------------------------------------- #
-# 14. M4 — 网络健壮性（5xx 降级重试后恢复 / 连接错误重试后恢复）+ env 解析回归
-#     注意：网络测试统一用 unittest.mock.patch("requests.request")，
-#     因为实际网络层走的是 requests 底层（非 responses 库）。
-# --------------------------------------------------------------------------- #
-class TestNetworkRobustnessM4:
-    @mock.patch("requests.request")
-    def test_5xx_mixed_degrade_then_success(self, mreq):
-        """5xx 混合（502 → 503 → 200）降级重试后恢复：最终成功且不抛 MubuError。"""
-        c = MubuClient(phone="p", password="w")
-        c.token = "t"
-        resp502 = mock.Mock()
-        resp502.status_code = 502
-        resp502.text = "502 Bad Gateway"
-        resp503 = mock.Mock()
-        resp503.status_code = 503
-        resp503.text = "503 Service Unavailable"
-        resp200 = mock.Mock()
-        resp200.status_code = 200
-        resp200.json.return_value = {"code": 0, "data": {"ok": True}}
-        seq = [resp502, resp503, resp200]
-
-        def side(*a, **k):
-            return seq.pop(0)
-
-        mreq.side_effect = side
-        with mock.patch("time.sleep"):
-            out = c._http_request("POST", "http://x/api", {"h": "1"})
-        # 最终成功返回最后的 200 响应，且未抛 MubuError
-        assert out is resp200
-        assert mreq.call_count == 3  # 1 首发 + 2 次重试
-
-    @mock.patch("requests.request")
-    def test_connection_error_retries_then_success(self, mreq):
-        """连接错误（ConnectionError → ConnectionError → 200）重试后恢复。"""
-        c = MubuClient(phone="p", password="w")
-        c.token = "t"
-        resp = mock.Mock()
-        resp.status_code = 200
-        resp.json.return_value = {"code": 0, "data": {}}
-        state = {"n": 0}
-
-        def side(*a, **k):
-            state["n"] += 1
-            if state["n"] <= 2:
-                raise requests.exceptions.ConnectionError("connection refused")
-            return resp
-
-        mreq.side_effect = side
-        with mock.patch("time.sleep"):
-            out = c._http_request("POST", "http://x/api", {"h": "1"})
-        assert out is resp
-        assert mreq.call_count == 3  # 1 首发 + 2 次重试
-
-    def test_env_key_stripped(self, tmp_path, monkeypatch):
-        """回归：_load_env_file 对 `KEY = VALUE` 中 = 两侧空白做 .strip()。
-
-        源码 mubu_api.py 的 _load_env_file 已对 key/value 做 .strip()，
-        此测试证明带空格写法 `MUBU_PHONE = x` 也能正确解析。
-        """
-        monkeypatch.setattr(mubu_api.os, "environ", {})
-        tok = tmp_path / "tok.json"
-        monkeypatch.setattr(mubu_api, "TOKEN_FILE", tok)
-        envf = tmp_path / ".env.mubu"
-        envf.write_text("MUBU_PHONE = x\nMUBU_PASSWORD = y\n", encoding="utf-8")
-        with mock.patch.object(mubu_api, "ENV_FILE", envf):
-            c = MubuClient()
-        assert c.phone == "x"   # = 左侧空白被去除
-        assert c.password == "y"  # = 右侧空白被去除

@@ -26,15 +26,11 @@ import time
 import argparse
 import requests
 from pathlib import Path
-from typing import Optional, Dict, List, Any, Tuple, Generator
 from contextlib import contextmanager
+import fcntl
+from typing import Optional, Dict, List, Any, Tuple, Iterator
 
-# fcntl 仅 Unix 可用（macOS / Linux / CI ubuntu）；Windows 等无 fcntl 平台降级为无锁
-try:
-    import fcntl
-except ImportError:  # pragma: no cover - 非 Unix 平台
-    fcntl = None
-
+# fcntl 仅 Unix 可用（fcntl.flock advisory lock）；非 Unix 平台不可用，记录备查（P2-6）
 # API 基础配置
 BASE_URL = "https://api2.mubu.com/v3/api"
 TOKEN_FILE = Path.home() / ".mubu_token"
@@ -82,6 +78,24 @@ MAX_SEARCH_DEPTH = 3
 MAX_SEARCH_LIMIT = 50
 # 整个搜索的 HTTP 请求数硬上限（get_list 调用次数）
 MAX_SEARCH_REQUESTS = 200
+
+
+# Token 文件跨进程 advisory 锁（Unix only，fcntl.flock；非 Unix 不可用，记录备查）（P2-6）
+@contextmanager
+def _token_file_lock() -> Iterator[None]:
+    """用 fcntl.flock 对 Token 文件加排他锁，避免多进程并发写损坏文件。
+
+    锁文件为 TOKEN_FILE 同目录下的 ``<name>.lock``；进入临界区前 flock(LOCK_EX)，
+    退出（含异常）时 flock(LOCK_UN)，异常路径保证锁释放。
+    """
+    lock_path = TOKEN_FILE.parent / (TOKEN_FILE.name + ".lock")
+    f = open(lock_path, "a")
+    try:
+        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+        f.close()
 
 
 class MubuError(Exception):
@@ -163,23 +177,6 @@ class MubuClient:
                 pass
         return False
 
-    @contextmanager
-    def _token_file_lock(self) -> Generator[None, None, None]:
-        """跨进程文件锁（Unix 专用）：保护 Token 原子写，避免并发写损坏。
-
-        仅 macOS / Linux / CI(ubuntu) 可用；Windows 等无 fcntl 平台直接降级为无锁。
-        """
-        lock_path = os.path.expanduser("~/.mubu_token.lock")
-        if fcntl is None:
-            yield
-            return
-        with open(lock_path, "w") as lf:
-            fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
-            try:
-                yield
-            finally:
-                fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
-
     def _save_token(self) -> None:
         """原子写 Token 到本地：先写临时文件再 rename，避免中途崩溃留残缺文件。
 
@@ -193,7 +190,7 @@ class MubuClient:
             "username": self.username,
             "expires_at": self.expires_at
         }
-        with self._token_file_lock():
+        with _token_file_lock():
             tmp = TOKEN_FILE.parent / (TOKEN_FILE.name + ".tmp")
             tmp.write_text(json.dumps(data, indent=2))
             os.rename(tmp, TOKEN_FILE)
@@ -425,41 +422,39 @@ class MubuClient:
         })
 
     def search(self, keyword: str, root_folder_id: str = "0",
-               max_depth: int = MAX_SEARCH_DEPTH, limit: int = MAX_SEARCH_LIMIT,
-               max_requests: int = MAX_SEARCH_REQUESTS) -> List[Dict]:
-        """本地递归搜索：名称包含关键字的文档与文件夹（T6）。
+               max_depth: int = MAX_SEARCH_DEPTH,
+               limit: int = MAX_SEARCH_LIMIT,
+               max_requests: int = MAX_SEARCH_REQUESTS) -> List[Dict[str, Any]]:
+        """本地递归搜索：名称包含关键字的文档与文件夹（T6，M4 T2 增强）。
 
-        mubu 无公开 /search 端点，本期采用本地过滤：从根文件夹开始递归遍历
-        所有子文件夹，收集 name 包含 keyword（大小写不敏感）的条目。
+        mubu 无公开 /search 端点，从根文件夹开始递归遍历所有子文件夹，
+        收集 name 包含 keyword（大小写不敏感）的条目。
 
-        限制（M4 T2，全部静默截断：超出即停止，不抛异常、不打断返回）：
+        三项上限均静默截断（不抛异常、不打断返回）：
         - max_depth: 递归深度上限（根 depth=0，默认 3 即最多展开 4 层）
-        - limit: 单节点子项上限（每个文件夹最多取前 N 个 docs / folders）
-        - max_requests: 整个搜索的 HTTP 请求数硬上限（get_list 调用次数）
+        - limit: 返回结果总数上限
+        - max_requests: 整个搜索的 get_list 请求数硬上限
 
         Args:
             keyword: 搜索关键字（大小写不敏感）
             root_folder_id: 遍历起点文件夹 ID，默认 "0"（根）
             max_depth: 递归深度上限
-            limit: 单文件夹子项上限
+            limit: 返回结果总数上限
             max_requests: 搜索总请求数硬上限
 
         Returns:
             匹配项列表，每项含 id / name / type（"doc" | "folder"）/ path（从根起的路径）
         """
         keyword_lower = (keyword or "").lower()
-        results: List[Dict] = []
-
-        # 整个搜索的 HTTP 请求计数（用于 max_requests 静默截断）
-        req_count = [0]
+        results: List[Dict[str, Any]] = []
+        req_count = 0
+        truncated = False
 
         def walk(folder_id: str, path: str, depth: int) -> None:
-            """递归遍历 folder_id，将命中项追加到 results。
-
-            命中三项限制时静默停止：请求数达上限、递归深度达上限、单节点子项达上限。
-            """
-            # 请求数硬上限：达到即停止遍历，避免超大账号下无限请求
-            if req_count[0] >= max_requests:
+            nonlocal req_count, truncated
+            if truncated or depth > max_depth or req_count >= max_requests:
+                if depth > max_depth or req_count >= max_requests:
+                    truncated = True
                 return
             try:
                 data = self.get_list(folder_id)
@@ -467,38 +462,28 @@ class MubuClient:
                 # 单个文件夹拉取失败不阻断整体遍历
                 print(f"警告: 遍历文件夹 {folder_id} 失败: {e}", file=sys.stderr)
                 return
-            req_count[0] += 1
-
-            # 单节点子项上限：静默截断，只取前 limit 个
-            folders = (data.get("folders", []) or [])[:limit]
-            docs = (data.get("docs", []) or [])[:limit]
-
-            # 文档匹配
+            req_count += 1
+            if len(results) >= limit:
+                truncated = True
+                return
+            folders = data.get("folders", []) or []
+            docs = data.get("docs", []) or []
             for d in docs:
-                name = d.get("name", "")
+                name = d.get("name") or ""
                 if keyword_lower and keyword_lower in name.lower():
-                    results.append({
-                        "id": d.get("id"),
-                        "name": name,
-                        "type": "doc",
-                        "path": path,
-                    })
-
-            # 文件夹匹配 + 递归子文件夹（受 max_depth 限制）
+                    results.append({"id": d.get("id"), "name": name, "type": "doc", "path": path})
+                    if len(results) >= limit:
+                        truncated = True
+                        return
             for f in folders:
-                name = f.get("name", "")
+                name = f.get("name") or ""
                 if keyword_lower and keyword_lower in name.lower():
-                    results.append({
-                        "id": f.get("id"),
-                        "name": name,
-                        "type": "folder",
-                        "path": path,
-                    })
-                # 递归进入子文件夹，路径追加当前文件夹名；
-                # depth 已达上限则不再深入，避免无限展开
-                if depth < max_depth:
-                    child_path = f"{path}/{name}" if path else name
-                    walk(f.get("id"), child_path, depth + 1)
+                    results.append({"id": f.get("id"), "name": name, "type": "folder", "path": path})
+                    if len(results) >= limit:
+                        truncated = True
+                        return
+                child_path = f"{path}/{name}" if path else name
+                walk(f.get("id"), child_path, depth + 1)
 
         walk(root_folder_id, "", 0)
         return results
@@ -780,7 +765,7 @@ def main() -> None:
     search_parser.add_argument("--max-depth", type=int, default=MAX_SEARCH_DEPTH,
                                help="递归深度上限（根 depth=0，默认 3 即最多展开 4 层）")
     search_parser.add_argument("--limit", type=int, default=MAX_SEARCH_LIMIT,
-                               help="单文件夹子项上限（默认 50）")
+                               help="返回结果上限（默认 50）")
     search_parser.add_argument("--json", action="store_true", help="JSON 格式输出")
 
     args = parser.parse_args()

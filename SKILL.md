@@ -45,29 +45,27 @@ export MUBU_PASSWORD="your_password"      # 幕布账号密码
 
 ### 1. 使用 MubuClient
 
-现代实现以 `MubuClient` 类为核心（位于 `scripts/mubu_api.py`）。登录响应与文档数据均为**扁平结构**：Token、用户 id / name 直接位于 `data` 下（不再有 `data["user"]` 嵌套），取值请用 `data["id"]` 而非旧版的 `data["user"]["id"]`。
+所有操作都通过 `scripts/mubu_api.py` 中的 `MubuClient` 类完成（**不再有**独立的
+`login()` / `create_folder()` / `create_doc()` / `get_list()` / `get_doc()` / `save_doc()` /
+`delete_item()` 模块级函数）。实例化时自动读取 `MUBU_PHONE` / `MUBU_PASSWORD`
+环境变量（或 `~/.workbuddy/.env.mubu`）并加载本地缓存 Token：
 
 ```python
-from mubu_api import MubuClient
+from scripts.mubu_api import MubuClient
 
-# 凭据来自环境变量 MUBU_PHONE / MUBU_PASSWORD，或 ~/.workbuddy/.env.mubu
+# 登录：凭据来自环境变量；返回扁平 data（token / id / name）
 client = MubuClient()
-result = client.login()  # 登录并本地缓存 Token
+info = client.login()
+print(info["user_id"], info["username"])   # 注意是扁平 data["id"]，非 data["user"]["id"]
 
-# result == {"token": data["token"], "user_id": data["id"], "username": data["name"]}
-print("user_id:", result["user_id"])   # 对应登录响应 data["id"]
-print("name:", result["username"])      # 对应登录响应 data["name"]
-
-# 创建文件夹 / 文档，直接返回 id
-folder_id = client.create_folder("项目", parent_id="0")
-doc_id = client.create_doc("大纲", folder_id=folder_id)
-
-# 获取文档（扁平 data 层，直接含 node 结构）
-doc = client.get_doc(doc_id)
-
-# 按名称本地搜索（从根递归遍历所有子文件夹，大小写不敏感）
-results = client.search("关键词")
+# 按名称本地搜索文档/文件夹（递归遍历，大小写不敏感）
+results = client.search("项目", max_depth=3, limit=50)
+for r in results:
+    print(r["type"], r["name"], r["path"])
 ```
+
+> 登录返回结构为**扁平** `data`：`data["id"]`=用户 ID，`data["name"]`=用户名，
+> `data["token"]`=令牌。这与旧版嵌套 `result["data"]["user"]["id"]` 不同。
 
 ---
 
@@ -192,6 +190,7 @@ def markdown_to_doc(md):
 | `save <doc_id> [--file <f>] [--md <file>] [--content <c>]` | 保存文档；`--md` 从 Markdown 文件导入 |
 | `delete <id>` | 删除文档或文件夹 |
 | `move <item_id> --target <folder_id>` | 移动文档到其他文件夹 |
+| `search <关键字> [--max-depth N] [--limit N]` | 按名称本地搜索文档/文件夹（递归遍历，大小写不敏感） |
 
 Markdown 往返示例：
 
@@ -305,8 +304,8 @@ MUBU_PASSWORD=你的密码
 | 从文件保存文档 | `python3 scripts/mubu_api.py save <doc_id> --file content.json` |
 | 移动文档 | `python3 scripts/mubu_api.py move <doc_id> --target <folder_id>` |
 | 删除文档 | `python3 scripts/mubu_api.py delete <id>` |
-| 按名称搜索 | `python3 scripts/mubu_api.py search <关键字>` |
-| 按名称搜索（JSON） | `python3 scripts/mubu_api.py search <关键字> --json` |
+| 按名称搜索 | `python3 scripts/mubu_api.py search <关键字> [--max-depth N] [--limit N]` |
+| 按名称搜索（JSON） | `python3 scripts/mubu_api.py search <关键字> [--max-depth N] [--limit N] --json` |
 
 ### 典型工作流
 
