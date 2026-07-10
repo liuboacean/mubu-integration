@@ -46,3 +46,8 @@
 - 新增 3 个测试：根 note 存在性与位置（在 children 之后）、空 note 省略（不产生孤立 `> ` 行）、含根 note 文档往返一致性（md→doc→md）。
 - 工程师 IS_PASS YES，QA 独立验证 48/48 全过（45 既有 + 3 新增），路由 NoOne。
 - 发布 ClawHub v1.1.5。
+
+## M7 (审计补充) — pytest CVE 版本锁定
+- `requirements.txt` `pytest>=7,<9` → `pytest>=8.3.5,<9`，修复 CVE-2025-71176（pytest tmpdir 处理漏洞；仅测试依赖，运行时不受影响）。
+- 48/48 测试全过（pytest 8.x 兼容）。
+- 发布 ClawHub v1.1.6。
