@@ -552,6 +552,10 @@ def export_markdown(doc: Dict[str, Any]) -> str:
     lines = [f"# {title}"]
     for child in root.get("children") or []:
         lines.append(doc_to_markdown(child, level=0))
+    # 根节点的 note（备注）在 children 之后输出
+    note = root.get("note")
+    if note:
+        lines.append(f"> {note}")
     return "\n".join(lines)
 
 

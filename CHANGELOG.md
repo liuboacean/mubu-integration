@@ -40,3 +40,9 @@
 - **Medium · 缺失破坏性操作警示（Missing User Warnings ×3）**：`delete` 增加 `⚠️ 删除不可逆` 明确提示；CLI 增加 `--yes` 显式确认标志，`main()` 删除分支硬拦截（未传 `--yes` 则打印警示并 `sys.exit(1)`，0 网络请求）。README 删除示例同步更新为 `delete <id> --yes`。
 - **验证**：pytest 45 用例全过；`py_compile` 通过；QA 独立 monkeypatch 复验确认 delete 无 `--yes` 时实际发出 0 次网络请求；7 项审计发现全部 RESOLVED，路由判定 NoOne。
 - 发布 ClawHub v1.1.4（清除 Review 状态）。
+
+## M6 (遗留清理) — 根节点 note 导出修复
+- 修复 `export_markdown()` 遗漏根节点 note 输出的 Bug：children 循环后追加 `f"> {note}"`（与子节点 note 格式一致）。
+- 新增 3 个测试：根 note 存在性与位置（在 children 之后）、空 note 省略（不产生孤立 `> ` 行）、含根 note 文档往返一致性（md→doc→md）。
+- 工程师 IS_PASS YES，QA 独立验证 48/48 全过（45 既有 + 3 新增），路由 NoOne。
+- 发布 ClawHub v1.1.5。

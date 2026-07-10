@@ -145,6 +145,50 @@ class TestRoundtrip:
 # --------------------------------------------------------------------------- #
 # 2. doc_to_markdown / export_markdown 单元
 # --------------------------------------------------------------------------- #
+class TestExportMarkdownRootNote:
+    """export_markdown 应输出根节点的 note（Bug 修复回归）"""
+
+    def test_root_note_appears_after_children(self):
+        """根节点 note 在 children 之后输出"""
+        doc = {
+            "node": {
+                "id": "root",
+                "text": "文档标题",
+                "note": "这是根节点的备注",
+                "children": [
+                    {"id": "c1", "text": "子节点1"},
+                    {"id": "c2", "text": "子节点2", "checked": True},
+                ],
+            }
+        }
+        result = export_markdown(doc)
+        assert "# 文档标题" in result
+        assert "- 子节点1" in result
+        assert "- [x] 子节点2" in result
+        assert "> 这是根节点的备注" in result
+        # 根 note 应在 children 之后
+        assert result.index("> 这是根节点的备注") > result.index("- [x] 子节点2")
+
+    def test_root_note_empty_omitted(self):
+        """根节点无 note 时不输出 > 行"""
+        doc = {"node": {"id": "root", "text": "标题"}}
+        result = export_markdown(doc)
+        assert result == "# 标题"
+        assert "> " not in result
+
+    def test_root_note_roundtrip_consistency(self):
+        """含根 note 的文档应能完整往返"""
+        md = (
+            "# 项目计划\n"
+            "- 阶段一\n"
+            "  - [x] 需求评审\n"
+            "> 项目总体备注\n"
+        )
+        doc = markdown_to_doc(md)
+        md2 = export_markdown(doc)
+        assert _norm_md(md2) == _norm_md(md)
+
+
 class TestDocToMarkdown:
     def test_export_markdown_title(self):
         doc = {"node": {"text": "标题", "children": []}}
