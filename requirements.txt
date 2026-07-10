@@ -1,5 +1,5 @@
 # 运行时依赖
-requests>=2.28,<3
+requests>=2.32.4,<3
 
 # 测试 / 开发依赖（CI 直接 pip install -r 使用）
 pytest>=7,<9

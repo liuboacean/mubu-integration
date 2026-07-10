@@ -198,8 +198,8 @@ python3 scripts/mubu_api.py save <doc_id> --md outline.md
 # 移动文档到其他文件夹
 python3 scripts/mubu_api.py move <doc_id> --target <folder_id>
 
-# 删除
-python3 scripts/mubu_api.py delete <id>
+# 删除（⚠️ 不可逆，执行前务必确认目标 ID；CLI 需显式 --yes 才会真正删除）
+python3 scripts/mubu_api.py delete <id> --yes
 
 # 按名称本地搜索文档/文件夹（递归遍历所有子文件夹，大小写不敏感）
 python3 scripts/mubu_api.py search "项目"
@@ -208,7 +208,7 @@ python3 scripts/mubu_api.py search "项目" --json
 
 ## Agent 触发词
 
-> 幕布、mubu、大纲笔记、思维导图导出、幕布同步
+> 幕布、mubu、幕布同步、幕布大纲导出
 
 当对话中出现以上关键词时，Skill 可被自动触发。
 

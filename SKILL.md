@@ -1,11 +1,19 @@
 ---
 name: mubu-integration
-description: 幕布笔记集成，支持登录认证、文档管理、文件夹操作、大纲导出等功能。触发词：幕布、mubu、大纲笔记、思维导图导出、幕布同步
+description: 幕布笔记集成，支持登录认证、文档管理、文件夹操作、大纲导出等功能。触发词：幕布、mubu、幕布同步、幕布大纲导出
 ---
 
 # 幕布集成 Skill
 
-幕布（mubu.com）是一款极简大纲笔记工具，支持一键生成思维导图。本 Skill 提供 API 集成能力。
+幕布（mubu.com）是一款极简大纲工具，支持将大纲一键转为思维导图。本 Skill 提供 API 集成能力。
+
+## 权限与安全边界
+本 Skill 以你的幕布账号身份操作**远程真实内容**，使用前请知悉其权限边界：
+- **读取**：仅读取环境变量 `MUBU_PHONE` / `MUBU_PASSWORD`（环境变量未设置时，才由仓库外的 `~/.workbuddy/.env.mubu` 补全，且不写回其它位置）。
+- **写入**：仅在本地写入 Token 缓存文件 `~/.mubu_token`（权限 `0o600` + 跨进程 `fcntl` 锁），不写入其它文件。
+- **网络**：仅访问 `api2.mubu.com`（base URL 可通过环境变量配置），**无第三方服务、无遥测、无数据外发**。
+- **破坏性操作需确认**：`save` / `move` / `delete` 会修改或删除你在幕布上的真实文档；其中 `delete` 为不可逆操作，CLI 必须显式传 `--yes` 才执行，否则中止并提示。
+- **信任边界**：Skill 不读取你的其它本地文件、不执行与幕布无关的 shell 命令；它只做「登录 → 读写你的幕布文档」这一件事。
 
 ## 功能概览
 
@@ -204,7 +212,7 @@ def markdown_to_doc(md):
 | `create <name> --folder <id> [--content <json>] [--md <file>]` | 创建文档；`--md` 从 Markdown 文件导入 |
 | `get <doc_id> [--export markdown\|json]` | 获取文档；`--export markdown` 输出真实 Markdown |
 | `save <doc_id> [--file <f>] [--md <file>] [--content <c>]` | 保存文档；`--md` 从 Markdown 文件导入 |
-| `delete <id>` | 删除文档或文件夹 |
+| `delete <id>` | 删除文档或文件夹（⚠️ 删除不可逆，执行前务必确认目标 ID；CLI 需显式 `--yes` 才会真正删除）|
 | `move <item_id> --target <folder_id>` | 移动文档到其他文件夹 |
 | `search <关键字> [--max-depth N] [--limit N]` | 按名称本地搜索文档/文件夹（递归遍历，大小写不敏感） |
 
@@ -283,7 +291,7 @@ MUBU_PASSWORD=你的密码
 
 ## Agent 使用指引
 
-当用户提到幕布、mubu、大纲笔记相关操作时，使用本 Skill 的脚本完成操作。
+当用户提到幕布、mubu 相关操作（如登录、文档/文件夹管理、大纲导入导出）时，使用本 Skill 的脚本完成操作。
 
 ### 前置检查
 
@@ -319,7 +327,7 @@ MUBU_PASSWORD=你的密码
 | 从 Markdown 保存文档 | `python3 scripts/mubu_api.py save <doc_id> --md outline.md` |
 | 从文件保存文档 | `python3 scripts/mubu_api.py save <doc_id> --file content.json` |
 | 移动文档 | `python3 scripts/mubu_api.py move <doc_id> --target <folder_id>` |
-| 删除文档 | `python3 scripts/mubu_api.py delete <id>` |
+| 删除文档 | `python3 scripts/mubu_api.py delete <id>`（⚠️ 删除不可逆，执行前务必确认目标 ID；CLI 需显式 `--yes` 才会真正删除）|
 | 按名称搜索 | `python3 scripts/mubu_api.py search <关键字> [--max-depth N] [--limit N]` |
 | 按名称搜索（JSON） | `python3 scripts/mubu_api.py search <关键字> [--max-depth N] [--limit N] --json` |
 

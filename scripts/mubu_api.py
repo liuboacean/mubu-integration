@@ -760,6 +760,9 @@ def main() -> None:
     # 删除
     delete_parser = subparsers.add_parser("delete", help="删除文档或文件夹")
     delete_parser.add_argument("id", help="文档或文件夹ID")
+    # Medium×3 修复：不可逆操作必须显式 --yes 才执行，否则 CLI 层中止。
+    delete_parser.add_argument("--yes", action="store_true",
+                               help="确认执行不可逆删除（必须显式传参）")
 
     # 移动
     move_parser = subparsers.add_parser("move", help="移动文档到其他文件夹")
@@ -830,6 +833,16 @@ def main() -> None:
             print("保存成功")
 
         elif args.command == "delete":
+            # Medium×3 修复：delete 为不可逆操作，CLI 层守卫。
+            # 未显式传 --yes 时，打印不可逆警示并 sys.exit(1) 中止，
+            # 绝不调用 client.delete(...)；仅当 args.yes 为真才执行删除。
+            if not args.yes:
+                print(
+                    f"⚠️ 删除不可逆：即将删除幕布文档/文件夹 {args.id}。"
+                    f"确认请加 --yes 重新执行。",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
             client.delete(args.id)
             print("删除成功")
 

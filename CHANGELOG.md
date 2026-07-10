@@ -32,3 +32,11 @@
 - P0-1：SKILL.md 清理旧版独立函数，改为指向 MubuClient 的引用与示例
 - T2 收尾：新增 `test_search_global_limit_enforced`，真实验证 `search()` 全局 `limit` 上限被强制执行（破坏性验证：移除上限逻辑则用例失败）
 - SKILL.md「Token 管理建议」示例修正：朴素 `open()+json.dump` 改为原子写（tempfile + os.replace）+ chmod 0o600，并注明真实 `_save_token` 还含跨进程 fcntl 锁；删除误导性的 `is_token_valid`
+
+## M5 (审计整改) — ClawHub Security Audit 全量修复（1 High + 6 Medium）
+- **High · 供应链（依赖未锁定 CVE）**：`requirements.txt` `requests>=2.28,<3` → `requests>=2.32.4,<3`，修复 CVE-2024-47081（.netrc 凭据泄漏）、CVE-2024-35195（Session 复用 `verify` 被覆盖）。CVE-2026-25645（extract_zipped_paths 临时文件复用）经核查本代码路径不可达，仅作升级加固。
+- **Medium · MCP 最小权限（Lp3）**：SKILL.md 新增 `## 权限与安全边界` 段落，明确声明只读/写入/网络/破坏性操作需确认/信任边界 5 条约束。
+- **Medium · 触发词歧义（Vague Triggers ×2）**：frontmatter `description` 与激活指引触发词收窄为 `幕布、mubu、幕布同步、幕布大纲导出`，移除易误触的 `大纲笔记`、`思维导图导出`；全仓 grep 复核 0 残留。
+- **Medium · 缺失破坏性操作警示（Missing User Warnings ×3）**：`delete` 增加 `⚠️ 删除不可逆` 明确提示；CLI 增加 `--yes` 显式确认标志，`main()` 删除分支硬拦截（未传 `--yes` 则打印警示并 `sys.exit(1)`，0 网络请求）。README 删除示例同步更新为 `delete <id> --yes`。
+- **验证**：pytest 45 用例全过；`py_compile` 通过；QA 独立 monkeypatch 复验确认 delete 无 `--yes` 时实际发出 0 次网络请求；7 项审计发现全部 RESOLVED，路由判定 NoOne。
+- 发布 ClawHub v1.1.4（清除 Review 状态）。
