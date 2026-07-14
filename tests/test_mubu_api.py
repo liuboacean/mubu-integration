@@ -29,12 +29,15 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
 import mubu_api
+import mubu.client  # v1.3.0 模块化：TOKEN_FILE/ENV_FILE 现归属 mubu.client 命名空间
 from mubu_api import (
     MubuClient,
     MubuError,
     doc_to_markdown,
     export_markdown,
     markdown_to_doc,
+    doc_to_opml,
+    doc_to_freeplane,
 )
 
 BASE_URL = mubu_api.BASE_URL
@@ -67,7 +70,7 @@ def _node_eq(a: dict, b: dict) -> bool:
 def isolated_client(tmp_path):
     """构造一个 token 文件被隔离、且持有有效 token 的客户端。"""
     tok = tmp_path / "tok.json"
-    with mock.patch.object(mubu_api, "TOKEN_FILE", tok):
+    with mock.patch.object(mubu.client, "TOKEN_FILE", tok):
         c = MubuClient(phone="p", password="w")
         c.token = "valid-token"
         c.expires_at = time.time() + 3600  # 远未过期，ensure_valid_token 不应重登
@@ -404,7 +407,7 @@ class TestAuthRetry:
 class TestSaveTokenAtomic:
     def test_no_tmp_leftover_and_content_complete(self, tmp_path):
         tok = tmp_path / "tok.json"
-        with mock.patch.object(mubu_api, "TOKEN_FILE", tok):
+        with mock.patch.object(mubu.client, "TOKEN_FILE", tok):
             c = MubuClient(phone="p", password="w")
             c.token = "abc"
             c.user_id = "u1"
@@ -420,7 +423,7 @@ class TestSaveTokenAtomic:
 
     def test_uses_os_rename(self, tmp_path):
         tok = tmp_path / "tok.json"
-        with mock.patch.object(mubu_api, "TOKEN_FILE", tok):
+        with mock.patch.object(mubu.client, "TOKEN_FILE", tok):
             with mock.patch("os.rename") as mren, \
                     mock.patch("os.chmod") as mchmod:
                 c = MubuClient(phone="p", password="w")
@@ -438,14 +441,18 @@ class TestCliParsing:
     def _run(self, argv, monkeypatch):
         """运行 main()，返回 (err, MubuClient_mock, markdown_to_doc_mock)。
 
-        必须在 mock 作用域内捕获 mock 对象，退出 with 后 mubu_api 已恢复为真实类，
+        必须在 mock 作用域内捕获 mock 对象，退出 with 后已恢复为真实类，
         直接在方法内引用 MubuClient 会丢失 return_value。
+
+        注：v1.3.0 模块化拆分后，cli.main 内部使用的名称来自各自子模块，
+        故此处 patch 目标指向「使用点」：mubu.cli.MubuClient /
+        mubu.cli.export_markdown / mubu.cli.markdown_to_doc / mubu.config.Path。
         """
         monkeypatch.setattr(sys, "argv", ["mubu_api.py"] + argv)
-        with mock.patch("mubu_api.MubuClient") as MC, \
-                mock.patch("mubu_api.export_markdown", return_value="# x") as EXP, \
-                mock.patch("mubu_api.markdown_to_doc", return_value={"node": {}}) as MD, \
-                mock.patch("mubu_api.Path") as MP:
+        with mock.patch("mubu.cli.MubuClient") as MC, \
+                mock.patch("mubu.cli.export_markdown", return_value="# x") as EXP, \
+                mock.patch("mubu.cli.markdown_to_doc", return_value={"node": {}}) as MD, \
+                mock.patch("mubu.config.Path") as MP:
             MP.return_value.read_text.return_value = ""
             err = None
             try:
@@ -635,10 +642,10 @@ class TestEnvFileLoading:
     def test_loads_when_env_unset(self, tmp_path, monkeypatch):
         monkeypatch.setattr(mubu_api.os, "environ", {})
         tok = tmp_path / "tok.json"
-        monkeypatch.setattr(mubu_api, "TOKEN_FILE", tok)
+        monkeypatch.setattr(mubu.client, "TOKEN_FILE", tok)
         envf = tmp_path / ".env.mubu"
         envf.write_text("MUBU_PHONE=x\nMUBU_PASSWORD=y\n", encoding="utf-8")
-        with mock.patch.object(mubu_api, "ENV_FILE", envf):
+        with mock.patch.object(mubu.client, "ENV_FILE", envf):
             c = MubuClient()
         assert c.phone == "x"
         assert c.password == "y"
@@ -646,10 +653,10 @@ class TestEnvFileLoading:
     def test_env_var_takes_precedence_over_file(self, tmp_path, monkeypatch):
         monkeypatch.setattr(mubu_api.os, "environ", {"MUBU_PHONE": "envval"})
         tok = tmp_path / "tok.json"
-        monkeypatch.setattr(mubu_api, "TOKEN_FILE", tok)
+        monkeypatch.setattr(mubu.client, "TOKEN_FILE", tok)
         envf = tmp_path / ".env.mubu"
         envf.write_text("MUBU_PHONE=fileval\nMUBU_PASSWORD=filepw\n", encoding="utf-8")
-        with mock.patch.object(mubu_api, "ENV_FILE", envf):
+        with mock.patch.object(mubu.client, "ENV_FILE", envf):
             c = MubuClient()
         assert c.phone == "envval"  # 环境变量优先于文件
         assert c.password == "filepw"  # password 未在 env，从文件补全
@@ -657,13 +664,13 @@ class TestEnvFileLoading:
     def test_env_file_ignores_comments_blanks_and_strips_quotes(self, tmp_path, monkeypatch):
         monkeypatch.setattr(mubu_api.os, "environ", {})
         tok = tmp_path / "tok.json"
-        monkeypatch.setattr(mubu_api, "TOKEN_FILE", tok)
+        monkeypatch.setattr(mubu.client, "TOKEN_FILE", tok)
         envf = tmp_path / ".env.mubu"
         envf.write_text(
             "# 注释行\n\nMUBU_PHONE='x'\nMUBU_PASSWORD=\"y\"\n   \nFOO=bar\n",
             encoding="utf-8",
         )
-        with mock.patch.object(mubu_api, "ENV_FILE", envf):
+        with mock.patch.object(mubu.client, "ENV_FILE", envf):
             c = MubuClient()
         assert c.phone == "x"  # 引号被剥离
         assert c.password == "y"
@@ -675,7 +682,7 @@ class TestEnvFileLoading:
         monkeypatch.delenv("MUBU_PHONE", raising=False)
         env = tmp_path / ".env.mubu"
         env.write_text('  MUBU_PHONE = 13800000000  \n', encoding="utf-8")
-        with mock.patch.object(mubu_api, "ENV_FILE", env):
+        with mock.patch.object(mubu.client, "ENV_FILE", env):
             c = MubuClient(phone="p", password="w")
         c._load_env_file(path=env)
         assert os.getenv("MUBU_PHONE") == "13800000000"
@@ -687,7 +694,7 @@ class TestEnvFileLoading:
 class TestTokenFilePerms:
     def test_save_token_sets_600(self, tmp_path, monkeypatch):
         tok = tmp_path / ".mubu_token"
-        monkeypatch.setattr(mubu_api, "TOKEN_FILE", tok)
+        monkeypatch.setattr(mubu.client, "TOKEN_FILE", tok)
         c = MubuClient(phone="p", password="w")
         c.token = "abc"
         c.user_id = "u"
@@ -812,7 +819,7 @@ class TestApiMethodPayloads:
     @responses.activate
     def test_login_request_body_and_token_extraction(self, tmp_path, monkeypatch):
         tok = tmp_path / "tok.json"
-        monkeypatch.setattr(mubu_api, "TOKEN_FILE", tok)
+        monkeypatch.setattr(mubu.client, "TOKEN_FILE", tok)
         responses.add(
             responses.POST, f"{BASE_URL}/user/phone_login",
             json={"code": 0, "data": {"token": "T1", "id": "U1", "name": "alice"}},
@@ -920,7 +927,7 @@ class TestDeleteGuard:
 
     def _invoke(self, argv, monkeypatch, tmp_path):
         monkeypatch.setattr(sys, "argv", ["mubu_api.py"] + argv)
-        monkeypatch.setattr(mubu_api, "TOKEN_FILE", self._write_token(tmp_path))
+        monkeypatch.setattr(mubu.client, "TOKEN_FILE", self._write_token(tmp_path))
         err = None
         try:
             mubu_api.main()
@@ -954,7 +961,7 @@ class TestDeleteGuard:
 class TestLoginCliNoPlaintextArgs:
     def _invoke(self, argv, monkeypatch, tmp_path):
         monkeypatch.setattr(sys, "argv", ["mubu_api.py"] + argv)
-        monkeypatch.setattr(mubu_api, "TOKEN_FILE", tmp_path / "tok.json")
+        monkeypatch.setattr(mubu.client, "TOKEN_FILE", tmp_path / "tok.json")
         err = None
         try:
             mubu_api.main()
@@ -1258,6 +1265,124 @@ class TestRequirementsSplit:
         assert "requests" in text
         assert "pytest" not in text
         assert "responses" not in text
+
+
+# --------------------------------------------------------------------------- #
+# 26. Roadmap — 整树导出 / 重命名 / OPML·FreeMind 导出
+# --------------------------------------------------------------------------- #
+class TestExportTree:
+    def test_export_tree_creates_nested_files(self, tmp_path):
+        client = MubuClient()
+        list_map = {
+            "0": {
+                "folders": [{"id": "f1", "name": "Folder B"}],
+                "docs": [{"id": "d1", "name": "Doc A"}],
+            },
+            "f1": {"folders": [], "docs": [{"id": "d2", "name": "Doc B"}]},
+        }
+        doc_map = {
+            "d1": {"node": {"text": "Doc A", "children": [{"text": "child1"}]}},
+            "d2": {"node": {"text": "Doc B", "children": []}},
+        }
+        with mock.patch.object(client, "get_list", side_effect=lambda fid: list_map[fid]), \
+             mock.patch.object(client, "get_doc", side_effect=lambda did: doc_map[did]):
+            stats = client.export_tree("0", str(tmp_path))
+        assert stats["docs"] == 2
+        assert stats["folders"] == 1
+        assert stats["errors"] == 0
+        assert (tmp_path / "Doc A.md").exists()
+        assert (tmp_path / "Folder B" / "Doc B.md").exists()
+        content = (tmp_path / "Doc A.md").read_text(encoding="utf-8")
+        assert "# Doc A" in content
+        assert "- child1" in content
+
+    def test_export_tree_handles_get_list_failure(self, tmp_path):
+        client = MubuClient()
+
+        def boom(fid):
+            raise MubuError("network down")
+
+        with mock.patch.object(client, "get_list", side_effect=boom):
+            stats = client.export_tree("0", str(tmp_path))
+        assert stats["errors"] == 1
+        assert stats["docs"] == 0
+
+
+class TestRename:
+    def test_rename_doc_calls_save_with_name(self):
+        client = MubuClient()
+        doc = {"node": {"text": "Old", "children": []}}
+        with mock.patch.object(client, "get_doc", return_value=doc) as mget, \
+             mock.patch.object(client, "save_doc") as msave:
+            client.rename_doc("d1", "New Name")
+        mget.assert_called_once_with("d1")
+        msave.assert_called_once()
+        args, kwargs = msave.call_args
+        assert "d1" in args
+        assert kwargs.get("name") == "New Name"
+
+    def test_rename_folder_uses_update_endpoint(self):
+        client = MubuClient()
+        with mock.patch.object(client, "_request") as mreq:
+            client.rename_folder("f1", "Renamed")
+        mreq.assert_called_once()
+        args, kwargs = mreq.call_args
+        assert args[0] == "POST"
+        assert args[1] == "/list/update_folder"
+        assert kwargs["json"]["id"] == "f1"
+        assert kwargs["json"]["name"] == "Renamed"
+
+
+class TestOpmlFreeplane:
+    def _sample_doc(self):
+        return {
+            "node": {
+                "text": "Root",
+                "children": [
+                    {"text": "A", "children": [{"text": "A1"}]},
+                    {"text": "B", "note": "hello"},
+                ],
+            }
+        }
+
+    def test_doc_to_opml_valid_xml(self):
+        import xml.etree.ElementTree as ET
+
+        xml = doc_to_opml(self._sample_doc())
+        assert xml.startswith("<?xml")
+        assert "<opml" in xml and 'version="2.0"' in xml
+        assert "<outline" in xml
+        root = ET.fromstring(xml)
+        assert root.tag == "opml"
+        outlines = [e for e in root.iter("outline")]
+        assert any(o.get("_note") == "hello" for o in outlines)
+
+    def test_doc_to_freeplane_valid_xml(self):
+        import xml.etree.ElementTree as ET
+
+        xml = doc_to_freeplane(self._sample_doc())
+        assert xml.startswith("<?xml")
+        assert "<map" in xml
+        assert "<node" in xml
+        root = ET.fromstring(xml)
+        assert root.tag == "map"
+
+
+class TestSafeFilename:
+    def test_illegal_chars_replaced(self):
+        from mubu_api import _safe_filename
+
+        assert _safe_filename("a/b:c*?d") == "a_b_c__d"
+
+    def test_empty_becomes_untitled(self):
+        from mubu_api import _safe_filename
+
+        assert _safe_filename("   ") == "untitled"
+
+    def test_normal_name_unchanged(self):
+        from mubu_api import _safe_filename
+
+        assert _safe_filename("我的文档 v1") == "我的文档 v1"
 
 
 # --------------------------------------------------------------------------- #

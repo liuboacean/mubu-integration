@@ -216,6 +216,9 @@ def markdown_to_doc(md):
 | `delete <id>` | 删除文档或文件夹（⚠️ 删除不可逆，执行前务必确认目标 ID；CLI 需显式 `--yes` 才会真正删除）|
 | `move <item_id> --target <folder_id>` | 移动文档到其他文件夹 |
 | `search <关键字> [--max-depth N] [--limit N]` | 按名称本地搜索文档/文件夹（递归遍历，大小写不敏感） |
+| `export-tree --folder <id> [--output <dir>] [--max-depth N]` | 递归导出整个文件夹树为嵌套 Markdown 文件 |
+| `rename <id> --name <新名> [--type doc\|folder]` | 重命名文档（`save_doc` name）或文件夹（逆向推测端点 `/list/update_folder`，真实环境需验证）|
+| `opml <doc_id> [--format opml\|freeplane]` | 导出为 OPML 2.0 / FreeMind XML（兼容 XMind 等其它大纲工具）|
 
 Markdown 往返示例：
 
@@ -235,6 +238,17 @@ python3 scripts/mubu_api.py move <doc_id> --target <folder_id>
 # 按名称本地搜索文档/文件夹（递归遍历所有子文件夹，大小写不敏感）
 python3 scripts/mubu_api.py search "项目"
 python3 scripts/mubu_api.py search "项目" --json
+
+# 递归导出整个文件夹树为嵌套 Markdown
+python3 scripts/mubu_api.py export-tree --folder <root_folder_id> --output ./backup
+
+# 重命名文档 / 文件夹
+python3 scripts/mubu_api.py rename <doc_id> --name "新标题" --type doc
+python3 scripts/mubu_api.py rename <folder_id> --name "新文件夹名" --type folder
+
+# 导出为 OPML / FreeMind
+python3 scripts/mubu_api.py opml <doc_id> --format opml
+python3 scripts/mubu_api.py opml <doc_id> --format freeplane
 ```
 
 ---

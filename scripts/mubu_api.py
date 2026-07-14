@@ -1,1029 +1,138 @@
 #!/usr/bin/env python3
+"""幕布 API 封装脚本 — 向后兼容 shim。
+
+历史的调用方式仍然有效：
+- ``import mubu_api`` 及其公开符号（MubuClient / MubuError / doc_to_markdown / ...）
+- ``python scripts/mubu_api.py <subcommand>``
+
+实际逻辑已迁移至 ``scripts/mubu/`` 包（config / convert / client / cli），
+本文件仅做重新导出，不重复实现，避免逻辑分叉。
+
+为保持对旧调用方与既有测试的最大兼容，本 shim 同时重新导出原单文件版本中
+存在的模块级标准库名称（os / sys / json / time / re / logging / getpass /
+argparse / requests / Path / ...），使 ``mubu_api.os``、``mubu_api.getpass``
+等引用依旧可用（os / getpass 为单例模块，monkeypatch 行为保持一致）。
+
+模块化拆分里程碑：v1.3.0（非 breaking）。
+
+能力一览：
+- 登录 / 列表 / 文件夹 / 文档 / 删除 / 移动
+- Markdown 导入导出（doc_to_markdown / export_markdown / markdown_to_doc）
+- 本地递归搜索（search）
+- 整树导出（export_tree）
+- 重命名（rename_doc 走 save_doc name；rename_folder 走逆向推测端点 /list/update_folder）
+- OPML / FreeMind 导出（doc_to_opml / doc_to_freeplane）
 """
-幕布 API 封装脚本
-支持登录、文档管理、文件夹操作、Markdown 导入导出等功能。
 
-M1（P0）阶段新增能力：
-- Markdown 导出：doc_to_markdown / export_markdown
-- Markdown 导入：markdown_to_doc
-- move 子命令
-- Token 刷新 + 401 仅重试 1 次（杜绝死循环）
-
-M2（P1）阶段新增能力（本期实现 T5 + T6）：
-- T5 网络健壮性：_request 增加 timeout=15、非 JSON 响应友好异常、网络层/5xx
-  指数退避重试（最多 2 次，与 401 重登重试清晰分层、互不干扰）
-- T5 .env 凭据加载：_load_env_file() 读取 ~/.workbuddy/.env.mubu（仅环境变量未设置时补全）
-- T5 Token 文件权限 600（_save_token 原子写后 chmod）
-- T6 本地搜索：search() 从根文件夹递归遍历，按名称本地过滤（mubu 无公开搜索端点）
-- CLI 新增 search 子命令
-"""
-
+# 标准库（作为模块级属性重新导出，保持向后兼容）
 import os
-import re
 import sys
 import json
 import time
+import re
 import logging
 import getpass
 import argparse
 import requests
+import fcntl
 from pathlib import Path
 from contextlib import contextmanager
 from urllib.parse import urlparse
-try:
-    import fcntl
-except ImportError:
-    fcntl = None  # 无 fcntl 平台（如 Windows）：锁降级为无操作
 from typing import Optional, Dict, List, Any, Tuple, Iterator
 
-# fcntl 跨进程 advisory 锁：Unix 用 fcntl.flock；无 fcntl 平台（Windows 等）降级为无操作（P2-6）
-
-# --------------------------------------------------------------------------- #
-# 日志（P1 #16）：用 logging 取代散落的 print；warning/error 分级，
-# --verbose 控制 debug；敏感内容（密码 / token）绝不进日志——只记录 msg，
-# 不记录请求体 / 响应体（body 已有 200 字符截断，见 MubuError）。
-# --------------------------------------------------------------------------- #
-logger = logging.getLogger("mubu_api")
-logger.propagate = False  # 不外传至 root，避免重复输出
-if not logger.handlers:
-    # 默认 stderr 处理器（导入期或尚未经 main() 配置时也能输出 warning/error）
-    _default_handler = logging.StreamHandler(sys.stderr)
-    _default_handler.setFormatter(logging.Formatter("%(levelname)s: %(message)s"))
-    logger.addHandler(_default_handler)
-logger.setLevel(logging.WARNING)
-
-# API 基础配置
-# 默认 base URL；允许通过环境变量 MUBU_BASE_URL 覆盖，但仅限 mubu.com 家族域名，
-# 防止指向恶意服务器造成 MITM / 凭据泄漏（安全官 #8）。
-DEFAULT_BASE_URL = "https://api2.mubu.com/v3/api"
-ALLOWED_BASE_HOSTS = ("api2.mubu.com", "api.mubu.com", "mubu.com")
-
-
-def _resolve_base_url() -> str:
-    """解析 base URL：优先 MUBU_BASE_URL，但仅接受 mubu.com 家族域名。
-
-    域名不在白名单时拒绝覆盖、回退默认并 stderr 告警（不静默信任），
-    避免攻击者通过环境变量将流量导向伪造服务器。
-    """
-    env_url = os.getenv("MUBU_BASE_URL")
-    if not env_url:
-        return DEFAULT_BASE_URL
-    try:
-        host = urlparse(env_url).hostname or ""
-    except Exception:
-        host = ""
-    if host in ALLOWED_BASE_HOSTS:
-        return env_url.rstrip("/")
-    logger.warning(
-        "MUBU_BASE_URL 域名 '%s' 不在允许列表（仅限 mubu.com 家族），"
-        "已忽略并使用默认地址 %s",
-        host, DEFAULT_BASE_URL,
-    )
-    return DEFAULT_BASE_URL
-
-
-BASE_URL = _resolve_base_url()
-TOKEN_FILE = Path.home() / ".mubu_token"
-
-# .env 凭据文件路径：仅当环境变量未设置时用于补全 MUBU_PHONE / MUBU_PASSWORD
-ENV_FILE = Path.home() / ".workbuddy" / ".env.mubu"
-
-# 默认请求头
-DEFAULT_HEADERS = {
-    "Content-Type": "application/json;charset=UTF-8",
-    "Origin": "https://mubu.com",
-    "Referer": "https://mubu.com/",
-    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-}
-
-# 接口路径常量：统一在此维护，便于后续集中修改。
-# 每个端点为 (HTTP 方法, 路径) 二元组；调用处用 self._request(*ENDPOINTS["key"], ...) 解包。
-ENDPOINTS = {
-    "login": ("POST", "/user/phone_login"),
-    "list": ("POST", "/list/get"),
-    "create_folder": ("POST", "/list/create_folder"),
-    "create_doc": ("POST", "/list/create_doc"),
-    "get_doc": ("POST", "/doc/get"),
-    "save_doc": ("POST", "/doc/save"),
-    "delete": ("POST", "/list/delete"),
-    "move": ("POST", "/list/move"),
-}
-
-# 网络重试配置（T5）
-# 单次请求超时（秒）
-REQUEST_TIMEOUT = 15
-# 网络层/5xx 最大重试次数（不含首次，即最多共发起 3 次请求）
-MAX_NETWORK_RETRIES = 2
-# 指数退避时间（秒）：第 1 次重试等 1s，第 2 次等 2s
-NETWORK_BACKOFF = (1, 2)
-# Token 文件权限：仅属主可读写
-TOKEN_FILE_MODE = 0o600
-# 异常 body 截断长度，避免超大响应体污染错误信息
-BODY_TRUNCATE = 200
-
-# 本地搜索（search）限制配置（M4 T2）
-# 根文件夹 depth=0，默认 3 即最多展开 4 层
-MAX_SEARCH_DEPTH = 3
-# 返回结果总数上限（单轮 search 命中条目硬上限，达到即静默截断）
-MAX_SEARCH_LIMIT = 50
-# 整个搜索的 HTTP 请求数硬上限（get_list 调用次数）
-MAX_SEARCH_REQUESTS = 200
-
-
-def _safe_local_path(path: str) -> Path:
-    """校验并解析本地文件路径，仅允许当前工作目录或其子目录（安全官 #3）。
-
-    拒绝绝对路径、``..`` 越界路径、以及跳出当前工作目录的路径，防止
-    ``create --md`` / ``save --file`` 读取 ``/etc/passwd``、``~/.ssh/id_rsa``
-    等任意文件并外发。校验失败抛 MubuError（清晰错误，而非原始栈）。
-
-    Args:
-        path: 用户传入的文件路径（来自 CLI --md / --file）
-
-    Returns:
-        解析后的绝对 Path（位于允许目录内）
-
-    Raises:
-        MubuError: 路径非法（绝对 / 越界 / 跳出允许目录）
-    """
-    # 0) 展开 ~ 为用户目录（如 ~/.ssh/id_rsa → /Users/.../.ssh/id_rsa），
-    #    展开后若为绝对路径将在下一步被明确拒绝，避免被静默解析为 cwd 下文件。
-    path = os.path.expanduser(path)
-    # 1) 拒绝越界片段（.. 跳出目录层级）
-    parts = [p for p in path.replace("\\", "/").split("/") if p not in ("", ".")]
-    if ".." in parts:
-        raise MubuError(f"拒绝越界路径（包含 '..'）: {path}")
-    # 2) 拒绝绝对路径
-    if os.path.isabs(path):
-        raise MubuError(f"拒绝读取绝对路径（可能越权访问系统文件）: {path}")
-    # 3) 解析后的真实路径必须位于当前工作目录内（含其自身，symlink 已被 realpath 展开）
-    resolved = os.path.realpath(path)
-    cwd = os.path.realpath(os.getcwd())
-    if resolved != cwd and not resolved.startswith(cwd + os.sep):
-        raise MubuError(f"拒绝访问允许目录（当前工作目录）之外的文件: {path}")
-    return Path(resolved)
-
-
-# Token 文件跨进程 advisory 锁（P2-6）：Unix 用 fcntl.flock；无 fcntl 平台降级为无操作
-@contextmanager
-def _token_file_lock() -> Iterator[None]:
-    """用 fcntl.flock 对 Token 文件加排他锁，避免多进程并发写损坏文件。
-
-    锁文件为 TOKEN_FILE 同目录下的 ``<name>.lock``；进入临界区前 flock(LOCK_EX)，
-    退出（含异常）时 flock(LOCK_UN)，异常路径保证锁释放。
-    无 fcntl 平台（如 Windows）：跳过加锁，仅单进程场景下依赖原子 rename 保证完整性。
-    """
-    if fcntl is None:
-        yield          # 无 fcntl：跳过加锁，仅单进程场景（原子 rename 仍保证完整性）
-        return
-    lock_path = TOKEN_FILE.parent / (TOKEN_FILE.name + ".lock")
-    f = open(lock_path, "a")
-    try:
-        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
-        yield
-    finally:
-        fcntl.flock(f.fileno(), fcntl.LOCK_UN)
-        f.close()
-
-
-class MubuError(Exception):
-    """幕布 API 基础异常。
-
-    M1 阶段定义基础结构（msg / status_code / body）。
-    M2 的 T5 在其基础上增强：body 自动截断前 BODY_TRUNCATE 字，
-    避免超大响应体（如限流 HTML 页面）撑爆错误信息。
-    请勿在此重复定义完整字段以外的内容。
-    """
-
-    def __init__(self, msg: str, status_code: Optional[int] = None, body: Any = None) -> None:
-        super().__init__(msg)
-        self.msg = msg
-        self.status_code = status_code
-        # body 若为字符串则截断，避免非 JSON / 错误页面撑爆异常信息
-        if isinstance(body, str) and len(body) > BODY_TRUNCATE:
-            body = body[:BODY_TRUNCATE]
-        self.body = body
-
-
-class MubuClient:
-    """幕布 API 客户端"""
-
-    def __init__(self, phone: Optional[str] = None, password: Optional[str] = None) -> None:
-        # T5：在读取 phone/password 之前，先尝试从 .env 文件补全凭据
-        self._load_env_file()
-        self.phone = phone or os.getenv("MUBU_PHONE")
-        self.password = password or os.getenv("MUBU_PASSWORD")
-        self.token = None
-        self.user_id = None
-        self.username = None
-        self.expires_at = 0  # Token 过期时间戳（秒）
-        # P2 #22：复用 requests.Session 连接池，search 多请求场景下避免每次新建连接
-        self._session = requests.Session()
-        self._load_token()
-
-    def _load_env_file(self, path: Optional[Path] = None) -> None:
-        """从 .env 文件加载凭据（仅当环境变量未设置时补全）。
-
-        默认读取 ENV_FILE（~/.workbuddy/.env.mubu）；文件不存在则静默跳过。
-        逐行解析 KEY=VALUE，忽略空行与 # 注释行。
-        仅补全 MUBU_PHONE / MUBU_PASSWORD，且环境变量已设置时优先于文件。
-
-        Args:
-            path: 可选，指定 .env 文件路径（便于测试；默认用 ENV_FILE）
-        """
-        env_path = path or ENV_FILE
-        if not env_path.exists():
-            return
-        # 安全官 #1：凭据文件仅属主可读写，加载时强制 600（失败不影响加载）
-        try:
-            os.chmod(env_path, 0o600)
-        except Exception:
-            pass
-        try:
-            for line in env_path.read_text(encoding="utf-8").splitlines():
-                line = line.strip()
-                if not line or line.startswith("#"):
-                    continue
-                if "=" not in line:
-                    continue
-                key, _, value = line.partition("=")
-                key = key.strip()
-                value = value.strip().strip('"').strip("'")
-                # 仅在环境变量未设置时补全
-                if key in ("MUBU_PHONE", "MUBU_PASSWORD") and not os.getenv(key):
-                    os.environ[key] = value
-        except Exception:
-            # 加载失败不影响主流程，后续 login 会提示设置环境变量
-            pass
-
-    def _load_token(self) -> bool:
-        """从本地加载 Token（未过期才生效）"""
-        if TOKEN_FILE.exists():
-            try:
-                data = json.loads(TOKEN_FILE.read_text())
-                expires_at = data.get("expires_at", 0)
-                if time.time() < expires_at:
-                    self.token = data.get("token")
-                    self.user_id = data.get("user_id")
-                    self.username = data.get("username")
-                    self.expires_at = expires_at
-                    return True
-            except Exception:
-                pass
-        return False
-
-    def _save_token(self) -> None:
-        """原子写 Token 到本地：先写临时文件再 rename，避免中途崩溃留残缺文件。
-
-        M2 的 T5：rename 之后追加 chmod 0o600，确保 Token 文件仅属主可读写。
-        M4 的 T3：原子写整体用跨进程文件锁包裹，避免多进程并发写损坏 Token 文件。
-        """
-        self.expires_at = time.time() + 7200  # 2 小时过期
-        data = {
-            "token": self.token,
-            "user_id": self.user_id,
-            "username": self.username,
-            "expires_at": self.expires_at
-        }
-        with _token_file_lock():
-            tmp = TOKEN_FILE.parent / (TOKEN_FILE.name + ".tmp")
-            tmp.write_text(json.dumps(data, indent=2))
-            os.rename(tmp, TOKEN_FILE)
-            # M2 的 T5：设置权限 600，防止其它用户读取 Token
-            os.chmod(TOKEN_FILE, TOKEN_FILE_MODE)
-
-    def _get_headers(self) -> Dict[str, str]:
-        """获取带认证的请求头"""
-        headers = DEFAULT_HEADERS.copy()
-        if self.token:
-            headers["jwt-token"] = self.token
-        return headers
-
-    def ensure_valid_token(self) -> None:
-        """确保 Token 有效，临近过期则重新登录。
-
-        刷新策略：未持有 token，或距过期不足 (300 + leeway) 秒时重新登录。
-        leeway=60 预留网络与处理余量。不依赖 refresh_token，凭据来自缓存的
-        phone/password。
-        """
-        leeway = 60
-        if not self.token or time.time() > self.expires_at - 300 - leeway:
-            self.login()
-
-    def _is_auth_error(self, result: Dict[str, Any], response: "requests.Response") -> bool:
-        """判断是否为鉴权失效错误。
-
-        仅当 HTTP 401，或响应 code 表示登录失效（含相关关键字）时返回 True。
-        403 权限不足或其它非 0 code 不触发重登，避免误重试。
-        """
-        if response.status_code == 401:
-            return True
-        code = result.get("code")
-        if code is not None and code != 0:
-            msg = str(result.get("msg", "")).lower()
-            # 收紧关键字：仅保留明确指向登录失效的短语，移除 "token"/"auth"/
-            # "expire"/"login"/"过期" 等易出现在正常业务错误中的泛化词，
-            # 避免误触发重登、掩盖真实错误（排障手 #7 / 安全官）
-            auth_keywords = (
-                "登录", "未登录", "重新登录", "登录失效", "unauthorized"
-            )
-            if any(k in msg for k in auth_keywords):
-                return True
-        return False
-
-    def _http_request(self, method: str, url: str, headers: Dict[str, str],
-                      **kwargs) -> requests.Response:
-        """执行一次 HTTP 请求，对网络层异常与 5xx 进行指数退避重试。
-
-        此层只负责网络健壮性，**不触发重登**：
-        - requests.exceptions.RequestException（超时/连接错误/网络抖动）→ 重试
-        - HTTP 5xx（服务端错误）→ 重试
-        重试上限 MAX_NETWORK_RETRIES（即最多共发起 3 次请求），退避见 NETWORK_BACKOFF。
-        4xx（含 401）等非 5xx 响应会原样返回，交由上层 _request 处理鉴权重试。
-        """
-        last_err: Optional[Exception] = None
-        for attempt in range(MAX_NETWORK_RETRIES + 1):
-            try:
-                logger.debug("HTTP %s %s (attempt=%s, timeout=%ss)",
-                             method, url, attempt + 1, REQUEST_TIMEOUT)
-                response = self._session.request(
-                    method, url, headers=headers, timeout=REQUEST_TIMEOUT, **kwargs
-                )
-            except requests.exceptions.RequestException as e:
-                # 网络层异常：退避后重试
-                last_err = e
-                if attempt < MAX_NETWORK_RETRIES:
-                    time.sleep(NETWORK_BACKOFF[min(attempt, len(NETWORK_BACKOFF) - 1)])
-                    continue
-                raise MubuError(
-                    f"网络连接失败，请检查网络（已重试 {MAX_NETWORK_RETRIES} 次）: {e}",
-                    status_code=None,
-                )
-
-            # 5xx 服务端错误 → 退避重试（不重登）
-            if response.status_code >= 500:
-                last_err = None
-                if attempt < MAX_NETWORK_RETRIES:
-                    time.sleep(NETWORK_BACKOFF[min(attempt, len(NETWORK_BACKOFF) - 1)])
-                    continue
-                raise MubuError(
-                    f"幕布服务暂不可用，请稍后重试（HTTP {response.status_code}，"
-                    f"已重试 {MAX_NETWORK_RETRIES} 次仍失败）",
-                    status_code=response.status_code,
-                    body=response.text,
-                )
-
-            # 非 5xx（含 401 等 4xx、2xx）原样返回，交由上层处理
-            return response
-
-        # 理论不可达：兜底抛错，避免漏掉 last_err
-        raise MubuError(
-            f"网络请求失败（非预期）: {last_err or '未知错误'}",
-            status_code=None,
-        )
-
-    def _request(self, method: str, endpoint: str, max_retries: int = 1,
-                 auth: bool = True, **kwargs: Any) -> Dict:
-        """发送 HTTP 请求，统一处理鉴权与重试。
-
-        分层说明（T5 增强）：
-        - 网络层/5xx 重试：由 _http_request 负责，最多 2 次，不重登。
-        - 鉴权失效重试：本方法递归处理，max_retries 默认 1（仅重试 1 次，杜绝死循环）。
-
-        两条链路互斥、互不干扰：网络重试只重发请求，鉴权重试才重登。
-
-        Args:
-            method: HTTP 方法
-            endpoint: 接口路径（取自 ENDPOINTS）
-            max_retries: 鉴权失败时的重试次数上限（默认 1，杜绝死循环）
-            auth: 是否需要在发起前确保 Token 有效（login 自身应传 False）
-        """
-        if auth:
-            self.ensure_valid_token()
-
-        logger.debug("请求 %s %s (auth=%s)", method, endpoint, auth)
-        url = f"{BASE_URL}{endpoint}"
-        headers = self._get_headers()
-        if "headers" in kwargs:
-            headers.update(kwargs.pop("headers"))
-
-        # 网络层/5xx 重试在 _http_request 内完成，这里拿到的是已确认非 5xx 的响应
-        response = self._http_request(method, url, headers, **kwargs)
-
-        # 响应体非 JSON（限流 HTML / 502 错误页等）→ 抛友好异常，不再抛裸 JSONDecodeError
-        try:
-            result = response.json()
-        except ValueError:
-            raise MubuError(
-                f"响应解析失败（status={response.status_code}, url={url}）："
-                f"响应体不是预期的 JSON",
-                status_code=response.status_code,
-                body=response.text,
-            )
-
-        # 仅鉴权失效才重登重试；第二次仍失败则抛错，不再重登
-        if self._is_auth_error(result, response):
-            if max_retries > 0:
-                self.login()
-                return self._request(method, endpoint, max_retries=max_retries - 1, auth=auth, **kwargs)
-            # 401 或登录失效类错误，重试后仍失败 → 给出下一步操作指引
-            raise MubuError(
-                f"登录失效或密码错误，请检查凭据后重试"
-                f"（{result.get('msg', '未知错误')}）",
-                status_code=response.status_code,
-                body=result,
-            )
-
-        if result.get("code") != 0:
-            # 403 权限不足或其它业务错误，不触发重登
-            if response.status_code == 403:
-                raise MubuError(
-                    f"权限不足，请确认账号权限"
-                    f"（{result.get('msg', '未知错误')}）",
-                    status_code=response.status_code,
-                    body=result,
-                )
-            raise MubuError(
-                f"API 错误: {result.get('msg', '未知错误')}",
-                status_code=response.status_code,
-                body=result,
-            )
-
-        return result.get("data", {})
-
-    def login(self) -> Dict:
-        """登录幕布（auth 引导，自身不走 ensure_valid_token）"""
-        if not self.phone or not self.password:
-            raise MubuError("请设置 MUBU_PHONE 和 MUBU_PASSWORD 环境变量，或传入参数")
-
-        data = self._request(*ENDPOINTS["login"], auth=False, max_retries=0, json={
-            "phone": self.phone,
-            "password": self.password,
-            "callbackType": 0
-        })
-
-        # 登录返回的是扁平结构，token 和用户信息都在 data 里
-        self.token = data["token"]
-        self.user_id = data["id"]
-        self.username = data["name"]
-        self._save_token()
-
-        return {
-            "token": self.token,
-            "user_id": self.user_id,
-            "username": self.username
-        }
-
-    def ensure_login(self) -> None:
-        """确保已登录（兼容旧调用；_request 内已统一处理）"""
-        if not self.token:
-            self.login()
-
-    def get_list(self, folder_id: str = "0") -> List[Dict]:
-        """获取文件夹下的文档和子文件夹列表"""
-        data = self._request(*ENDPOINTS["list"], json={"folderId": folder_id})
-        return data
-
-    def create_folder(self, name: str, parent_id: str = "0") -> str:
-        """创建文件夹"""
-        data = self._request(*ENDPOINTS["create_folder"], json={
-            "folderId": parent_id,
-            "name": name
-        })
-        return data.get("folder", {}).get("id", "")
-
-    def create_doc(self, name: str, folder_id: str = "0", content: str = "") -> str:
-        """创建文档"""
-        data = self._request(*ENDPOINTS["create_doc"], json={
-            "folderId": folder_id,
-            "name": name,
-            "content": content
-        })
-        return data.get("doc", {}).get("id", "")
-
-    def get_doc(self, doc_id: str) -> Dict:
-        """获取文档内容"""
-        return self._request(*ENDPOINTS["get_doc"], json={"id": doc_id})
-
-    def save_doc(self, doc_id: str, content: str, name: Optional[str] = None) -> None:
-        """保存文档"""
-        data = {"id": doc_id, "content": content}
-        if name:
-            data["name"] = name
-        self._request(*ENDPOINTS["save_doc"], json=data)
-
-    def delete(self, item_id: str) -> None:
-        """删除文档或文件夹"""
-        self._request(*ENDPOINTS["delete"], json={"id": item_id})
-
-    def move(self, item_id: str, target_folder_id: str) -> None:
-        """移动文档到其他文件夹"""
-        self._request(*ENDPOINTS["move"], json={
-            "id": item_id,
-            "folderId": target_folder_id
-        })
-
-    def search(self, keyword: str, root_folder_id: str = "0",
-               max_depth: int = MAX_SEARCH_DEPTH,
-               limit: int = MAX_SEARCH_LIMIT,
-               max_requests: int = MAX_SEARCH_REQUESTS) -> Dict[str, Any]:
-        """本地递归搜索：名称包含关键字的文档与文件夹（T6，M4 T2 增强）。
-
-        mubu 无公开 /search 端点，从根文件夹开始递归遍历所有子文件夹，
-        收集 name 包含 keyword（大小写不敏感）的条目。
-
-        为保护调用方，到达以下任一上限即停止遍历并标记 truncated=True
-        （不再静默丢失信息，调用方据此知晓结果可能不完整）：
-        - max_depth: 递归深度上限（根 depth=0，默认 3 即最多展开 4 层）
-        - limit: 返回结果总数上限
-        - max_requests: 整个搜索的 get_list 请求数硬上限
-
-        环检测：已访问的 folder_id 进入 visited 集合，遇到重复引用直接跳过，
-        防止幕布返回环引用时无限递归（max_requests 之上的第二道防线）。
-
-        Args:
-            keyword: 搜索关键字（大小写不敏感）
-            root_folder_id: 遍历起点文件夹 ID，默认 "0"（根）
-            max_depth: 递归深度上限
-            limit: 返回结果总数上限
-            max_requests: 搜索总请求数硬上限
-
-        Returns:
-            字典 {"results": [...], "truncated": bool, "limit": int, "max_depth": int}
-            - results: 匹配项列表，每项含 id / name / type（"doc" | "folder"）
-              / path（从根起的路径）
-            - truncated: 是否因达到上限而提前结束（结果可能不完整）
-        """
-        keyword_lower = (keyword or "").lower()
-        results: List[Dict[str, Any]] = []
-        req_count = 0
-        truncated = False
-        visited: set = set()  # 已访问 folder_id，防环引用无限递归
-
-        def walk(folder_id: str, path: str, depth: int) -> None:
-            nonlocal req_count, truncated
-            if folder_id in visited:
-                return  # 已访问，去重（防环）
-            visited.add(folder_id)
-            if truncated or depth > max_depth or req_count >= max_requests:
-                if depth > max_depth or req_count >= max_requests:
-                    truncated = True
-                return
-            try:
-                data = self.get_list(folder_id)
-            except MubuError as e:
-                # 单个文件夹拉取失败不阻断整体遍历
-                logger.warning("遍历文件夹 %s 失败: %s", folder_id, e)
-                return
-            req_count += 1
-            if len(results) >= limit:
-                truncated = True
-                return
-            folders = data.get("folders", []) or []
-            docs = data.get("docs", []) or []
-            for d in docs:
-                name = d.get("name") or ""
-                if keyword_lower and keyword_lower in name.lower():
-                    results.append({"id": d.get("id"), "name": name, "type": "doc", "path": path})
-                    if len(results) >= limit:
-                        truncated = True
-                        return
-            for f in folders:
-                name = f.get("name") or ""
-                if keyword_lower and keyword_lower in name.lower():
-                    results.append({"id": f.get("id"), "name": name, "type": "folder", "path": path})
-                    if len(results) >= limit:
-                        truncated = True
-                        return
-                child_path = f"{path}/{name}" if path else name
-                walk(f.get("id"), child_path, depth + 1)
-
-        walk(root_folder_id, "", 0)
-        return {
-            "results": results,
-            "truncated": truncated,
-            "limit": limit,
-            "max_depth": max_depth,
-        }
-
-
-def doc_to_markdown(node: Dict[str, Any], level: int = 0) -> str:
-    """将节点（及其子树）递归渲染为 Markdown 列表片段。
-
-    子节点使用 '- ' 列表项，缩进 = 2 * level；含 checked 渲染为 '- [x]'/'- [ ]'；
-    含 note 在其子树之后追加 '> {note}'。根标题（'# '）由 export_markdown 负责。
-
-    Args:
-        node: 节点字典，可包含 text / checked / note / children
-        level: 当前节点深度（根节点的直接子节点为 0）
-
-    Returns:
-        Markdown 列表片段（不含根标题行）
-    """
-    lines: List[str] = []
-    text = (node.get("text") or "").replace("\n", " ")
-    indent = " " * (2 * level)
-
-    # 勾选状态（mark 为单个字符 x / 空格）
-    if node.get("checked") is not None:
-        mark = "x" if node.get("checked") else " "
-        lines.append(f"{indent}- [{mark}] {text}")
-    else:
-        lines.append(f"{indent}- {text}")
-
-    # 递归子节点（位于 note 之前）
-    for child in node.get("children") or []:
-        lines.append(doc_to_markdown(child, level + 1))
-
-    # 备注：节点（含其子树）之后追加
-    note = node.get("note")
-    if note:
-        lines.append(f"{indent}> {note}")
-
-    return "\n".join(lines)
-
-
-def export_markdown(doc: Dict[str, Any]) -> str:
-    """将文档 data 层转换为 Markdown 文本。
-
-    Args:
-        doc: get_doc() 返回的 data 层，结构 {"node": {"text":..., "children":[...]}}
-
-    Returns:
-        Markdown 文本（首行为 '# 标题'）
-
-    Raises:
-        MubuError: 文档结构无效（既无有效 text 也无 children）时
-    """
-    root = doc.get("node") or doc
-    if not isinstance(root, dict) or (not root.get("text") and not root.get("children")):
-        raise MubuError("无效的文档结构")
-
-    title = (root.get("text") or "").replace("\n", " ")
-    lines = [f"# {title}"]
-    for child in root.get("children") or []:
-        lines.append(doc_to_markdown(child, level=0))
-    # 根节点的 note（备注）在 children 之后输出
-    note = root.get("note")
-    if note:
-        lines.append(f"> {note}")
-    return "\n".join(lines)
-
-
-def markdown_to_doc(md: str) -> Dict[str, Any]:
-    r"""将 Markdown 文本解析为幕布文档结构。
-
-    解析规则（按行）：
-    - 标题 '^#+\s+(.*)' → 顶层节点；多个顶层标题时第一个为 root，其余作为 root 的 children
-    - 无序列表 '^(\s*)-\s+(.*)' → 子节点；前导空格数 // 2 = 相对深度，用栈维护 (depth → node)
-    - 勾选 '- [ ]'/'- [x]' → 设 checked
-    - 引用 '^(\s*)>\s+(.*)' → 作为上一层级节点的 note（按缩进深度归属）
-    - 纯文本无列表 → 整个作为单节点正文
-
-    Returns:
-        {"node": {"id": "root", "text": ..., "children": [...]}}
-    """
-    root_node: Dict[str, Any] = {"id": "root", "text": "", "children": []}
-    counter = [0]
-
-    def next_id() -> str:
-        counter[0] += 1
-        return f"node_{counter[0]}"
-
-    lines = md.split("\n")
-
-    # 收集所有标题行
-    headings: List[str] = []
-    for line in lines:
-        if not line.strip():
-            continue
-        m = re.match(r"^#+\s+(.*)$", line)
-        if m:
-            headings.append(m.group(1).strip())
-
-    # 是否存在列表项
-    has_list = any(
-        re.match(r"^\s*-\s+", line) for line in lines if line.strip()
-    )
-
-    # 纯文本（无标题且无列表）
-    if not headings and not has_list:
-        text = md.strip()
-        if text:
-            root_node["text"] = text
-        return {"node": root_node}
-
-    # 设置 root 文本，其余标题作为 root 的 children
-    if headings:
-        root_node["text"] = headings[0]
-        for h in headings[1:]:
-            root_node["children"].append({"id": next_id(), "text": h, "children": []})
-
-    if not has_list:
-        return {"node": root_node}
-
-    # 用栈维护 (depth, node)；栈底为 root
-    stack: List[Tuple[int, Dict[str, Any]]] = [(0, root_node)]
-
-    for line in lines:
-        if not line.strip():
-            continue
-
-        # 标题行已处理（root 文本 / children），跳过
-        if re.match(r"^#+\s+", line):
-            continue
-
-        # 引用 → 作为对应层级节点的 note
-        m_note = re.match(r"^(\s*)>\s+(.*)$", line)
-        if m_note:
-            note_depth = len(m_note.group(1)) // 2
-            note_text = m_note.group(2).strip()
-            target = root_node
-            for d, n in reversed(stack):
-                if d == note_depth:
-                    target = n
-                    break
-            target["note"] = note_text
-            continue
-
-        # 无序列表项
-        m_list = re.match(r"^(\s*)-\s+(.*)$", line)
-        if m_list:
-            indent = len(m_list.group(1))
-            depth = indent // 2
-            content = m_list.group(2).strip()
-
-            # 勾选状态
-            checked: Optional[bool] = None
-            mc = re.match(r"^\[([ xX])\]\s+(.*)$", content)
-            if mc:
-                checked = mc.group(1).lower() == "x"
-                content = mc.group(2).strip()
-
-            node: Dict[str, Any] = {"id": next_id(), "text": content, "children": []}
-            if checked is not None:
-                node["checked"] = checked
-
-            # 弹出比当前深度更深或相等的节点，找到父节点
-            while stack and stack[-1][0] >= depth:
-                stack.pop()
-            parent = stack[-1][1] if stack else root_node
-            parent.setdefault("children", []).append(node)
-            stack.append((depth, node))
-            continue
-
-    return {"node": root_node}
-
-
-def format_list(data: Dict) -> str:
-    """格式化文档列表为可读文本。
-
-    T5：仅使用 docs 键（data.get("docs")），与 get_list 返回结构对齐，
-    移除对 documents 键的兜底。
-    """
-    lines = []
-    folders = data.get("folders", [])
-    docs = data.get("docs", [])
-
-    if folders:
-        lines.append("📁 文件夹:")
-        for f in folders:
-            name = f.get("name", "未命名")
-            fid = f.get("id", "")
-            lines.append(f"  [{fid}] {name}")
-
-    if docs:
-        lines.append("\n📄 文档:")
-        for d in docs:
-            name = d.get("name", "未命名")
-            did = d.get("id", "")
-            lines.append(f"  [{did}] {name}")
-
-    if not folders and not docs:
-        lines.append("（空）")
-
-    return "\n".join(lines)
-
-
-def format_search(results: List[Dict]) -> str:
-    """格式化搜索结果为可读文本，复用 format_list 的分区展示风格（T6）。
-
-    将匹配项分为 📁 文件夹 / 📄 文档 两区，命中项附带路径（path）便于定位。
-    """
-    folders = [r for r in results if r.get("type") == "folder"]
-    docs = [r for r in results if r.get("type") == "doc"]
-    lines = []
-
-    if folders:
-        lines.append("📁 文件夹:")
-        for f in folders:
-            path = f.get("path", "")
-            suffix = f"  ({path})" if path else ""
-            lines.append(f"  [{f.get('id')}] {f.get('name')}{suffix}")
-
-    if docs:
-        lines.append("\n📄 文档:")
-        for d in docs:
-            path = d.get("path", "")
-            suffix = f"  ({path})" if path else ""
-            lines.append(f"  [{d.get('id')}] {d.get('name')}{suffix}")
-
-    if not folders and not docs:
-        lines.append("（无匹配结果）")
-
-    return "\n".join(lines)
-
-
-def _configure_logging(verbose: bool) -> None:
-    """配置 mubu_api 日志（P1 #16）。
-
-    每次运行前清理旧 handler，避免跨进程 / 跨测试绑定到失效的 stderr
-    （capsys 场景：每轮测试替换 sys.stderr，handler 必须重绑当前对象）。
-    - 默认 WARNING：仅输出 warning / error
-    - --verbose：DEBUG，输出请求级调试信息
-    """
-    for h in list(logger.handlers):
-        logger.removeHandler(h)
-    # 绑定当前 sys.stderr（capsys 生效时为捕获对象，确保测试可断言）
-    handler = logging.StreamHandler(sys.stderr)
-    handler.setFormatter(logging.Formatter("%(levelname)s: %(message)s"))
-    logger.addHandler(handler)
-    logger.setLevel(logging.DEBUG if verbose else logging.WARNING)
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser(description="幕布 API 命令行工具")
-    # P1 #16：--verbose 控制 debug 日志（默认仅 warning/error）
-    parser.add_argument("--verbose", action="store_true",
-                        help="输出调试日志（DEBUG 级别，含请求级信息）")
-    subparsers = parser.add_subparsers(dest="command", help="可用命令")
-
-    # 登录（凭据取自环境变量 / ~/.workbuddy/.env.mubu；缺失时交互式输入，
-    # 不再提供 --phone/--password 明文参数，避免出现在 ps / shell 历史中）
-    login_parser = subparsers.add_parser(
-        "login", help="登录幕布（凭据取自环境变量 / .env.mubu，缺失时交互式输入）"
-    )
-
-    # 列表
-    list_parser = subparsers.add_parser("list", help="获取文档列表")
-    list_parser.add_argument("--folder", default="0", help="文件夹ID")
-    list_parser.add_argument("--json", action="store_true", help="JSON 格式输出")
-
-    # 创建文件夹
-    folder_parser = subparsers.add_parser("mkdir", help="创建文件夹")
-    folder_parser.add_argument("name", help="文件夹名称")
-    folder_parser.add_argument("--parent", default="0", help="父文件夹ID")
-
-    # 创建文档
-    doc_parser = subparsers.add_parser("create", help="创建文档")
-    doc_parser.add_argument("name", help="文档名称")
-    doc_parser.add_argument("--folder", default="0", help="文件夹ID")
-    doc_parser.add_argument("--content", default="", help="文档内容（大纲 JSON 字符串）")
-    doc_parser.add_argument("--md", help="从 Markdown 文件导入内容")
-
-    # 获取文档
-    get_parser = subparsers.add_parser("get", help="获取文档内容")
-    get_parser.add_argument("doc_id", help="文档ID")
-    get_parser.add_argument("--export", choices=["markdown", "json"], default="json", help="导出格式")
-
-    # 保存文档
-    save_parser = subparsers.add_parser("save", help="保存文档")
-    save_parser.add_argument("doc_id", help="文档ID")
-    save_parser.add_argument("--file", help="从文件读取内容（原始大纲 JSON）")
-    save_parser.add_argument("--md", help="从 Markdown 文件导入内容")
-    save_parser.add_argument("--content", help="直接指定内容")
-
-    # 删除
-    delete_parser = subparsers.add_parser("delete", help="删除文档或文件夹")
-    delete_parser.add_argument("id", help="文档或文件夹ID")
-    # Medium×3 修复：不可逆操作必须显式 --yes 才执行，否则 CLI 层中止。
-    delete_parser.add_argument("--yes", action="store_true",
-                               help="确认执行不可逆删除（必须显式传参）")
-
-    # 移动
-    move_parser = subparsers.add_parser("move", help="移动文档到其他文件夹")
-    move_parser.add_argument("item_id", help="文档ID")
-    move_parser.add_argument("--target", required=True, help="目标文件夹ID")
-
-    # 搜索（T6，M4 T2 增加 --max-depth / --limit）
-    search_parser = subparsers.add_parser("search", help="本地搜索文档/文件夹（按名称）")
-    search_parser.add_argument("keyword", help="搜索关键字（大小写不敏感）")
-    search_parser.add_argument("--max-depth", type=int, default=MAX_SEARCH_DEPTH,
-                               help="递归深度上限（根 depth=0，默认 3 即最多展开 4 层）")
-    search_parser.add_argument("--limit", type=int, default=MAX_SEARCH_LIMIT,
-                               help="返回结果上限（默认 50）")
-    search_parser.add_argument("--json", action="store_true", help="JSON 格式输出")
-
-    args = parser.parse_args()
-    _configure_logging(args.verbose)
-
-    if not args.command:
-        parser.print_help()
-        return
-
-    try:
-        client = MubuClient()
-
-        if args.command == "login":
-            # 凭据优先来自环境变量 / .env.mubu；缺失时交互式输入
-            # （无明文 CLI 参数，避免 ps / shell 历史泄露）
-            if not client.phone:
-                try:
-                    client.phone = input("请输入幕布手机号: ").strip()
-                except EOFError:
-                    pass
-            if not client.password:
-                try:
-                    client.password = getpass.getpass("请输入幕布密码: ")
-                except EOFError:
-                    pass
-            result = client.login()
-            print(f"登录成功: {result['username']} (ID: {result['user_id']})")
-
-        elif args.command == "list":
-            data = client.get_list(args.folder)
-            if args.json:
-                print(json.dumps(data, indent=2, ensure_ascii=False))
-            else:
-                print(format_list(data))
-
-        elif args.command == "mkdir":
-            folder_id = client.create_folder(args.name, args.parent)
-            print(f"创建文件夹成功: {folder_id}")
-
-        elif args.command == "create":
-            md_path = getattr(args, "md", None)
-            if md_path:
-                safe = _safe_local_path(md_path)
-                content = json.dumps(markdown_to_doc(safe.read_text(encoding="utf-8")), ensure_ascii=False)
-            else:
-                content = args.content
-            doc_id = client.create_doc(args.name, args.folder, content)
-            print(f"创建文档成功: {doc_id}")
-
-        elif args.command == "get":
-            doc = client.get_doc(args.doc_id)
-            if args.export == "json":
-                print(json.dumps(doc, indent=2, ensure_ascii=False))
-            else:
-                print(export_markdown(doc))
-
-        elif args.command == "save":
-            md_path = getattr(args, "md", None)
-            file_path = args.file
-            if md_path:
-                safe = _safe_local_path(md_path)
-                content = json.dumps(markdown_to_doc(safe.read_text(encoding="utf-8")), ensure_ascii=False)
-            elif file_path:
-                safe = _safe_local_path(file_path)
-                content = safe.read_text(encoding="utf-8")
-            elif args.content:
-                content = args.content
-            else:
-                content = sys.stdin.read()
-            client.save_doc(args.doc_id, content)
-            print("保存成功")
-
-        elif args.command == "delete":
-            # Medium×3 修复：delete 为不可逆操作，CLI 层守卫。
-            # 未显式传 --yes 时，打印不可逆警示并 sys.exit(1) 中止，
-            # 绝不调用 client.delete(...)；仅当 args.yes 为真才执行删除。
-            if not args.yes:
-                logger.warning(
-                    "删除不可逆：即将删除幕布文档/文件夹 %s。确认请加 --yes 重新执行。",
-                    args.id,
-                )
-                sys.exit(1)
-            client.delete(args.id)
-            print("删除成功")
-
-        elif args.command == "move":
-            client.move(args.item_id, args.target)
-            print(f"移动成功: {args.item_id} -> {args.target}")
-
-        elif args.command == "search":
-            result = client.search(
-                args.keyword,
-                max_depth=args.max_depth,
-                limit=args.limit,
-            )
-            results = result["results"]
-            # 结果因达到上限被截断时，提示调用方结果可能不完整
-            if result.get("truncated"):
-                logger.warning(
-                    "搜索因达到上限（limit=%s）而提前结束，结果可能不完整",
-                    result.get("limit"),
-                )
-            if args.json:
-                print(json.dumps(results, indent=2, ensure_ascii=False))
-            else:
-                print(format_search(results))
-
-    except Exception as e:
-        # 仅记录 msg（已脱敏：不含密码/token/原始 body），不泄露敏感信息
-        logger.error("%s", e)
-        sys.exit(1)
-
+# 包内模块符号
+from mubu.config import (
+    logger,
+    DEFAULT_BASE_URL,
+    ALLOWED_BASE_HOSTS,
+    _resolve_base_url,
+    BASE_URL,
+    TOKEN_FILE,
+    ENV_FILE,
+    DEFAULT_HEADERS,
+    ENDPOINTS,
+    REQUEST_TIMEOUT,
+    MAX_NETWORK_RETRIES,
+    NETWORK_BACKOFF,
+    TOKEN_FILE_MODE,
+    BODY_TRUNCATE,
+    MAX_SEARCH_DEPTH,
+    MAX_SEARCH_LIMIT,
+    MAX_SEARCH_REQUESTS,
+    _token_file_lock,
+    MubuError,
+    _safe_local_path,
+)
+from mubu.convert import (
+    doc_to_markdown,
+    export_markdown,
+    _safe_filename,
+    doc_to_opml,
+    doc_to_freeplane,
+    markdown_to_doc,
+    format_list,
+    format_search,
+)
+from mubu.client import MubuClient
+from mubu.cli import main, _configure_logging
+
+__all__ = [
+    # 标准库（兼容旧引用）
+    "os",
+    "sys",
+    "json",
+    "time",
+    "re",
+    "logging",
+    "getpass",
+    "argparse",
+    "requests",
+    "fcntl",
+    "Path",
+    "contextmanager",
+    "urlparse",
+    "Optional",
+    "Dict",
+    "List",
+    "Any",
+    "Tuple",
+    "Iterator",
+    # config
+    "logger",
+    "DEFAULT_BASE_URL",
+    "ALLOWED_BASE_HOSTS",
+    "_resolve_base_url",
+    "BASE_URL",
+    "TOKEN_FILE",
+    "ENV_FILE",
+    "DEFAULT_HEADERS",
+    "ENDPOINTS",
+    "REQUEST_TIMEOUT",
+    "MAX_NETWORK_RETRIES",
+    "NETWORK_BACKOFF",
+    "TOKEN_FILE_MODE",
+    "BODY_TRUNCATE",
+    "MAX_SEARCH_DEPTH",
+    "MAX_SEARCH_LIMIT",
+    "MAX_SEARCH_REQUESTS",
+    "_token_file_lock",
+    "MubuError",
+    "_safe_local_path",
+    # convert
+    "doc_to_markdown",
+    "export_markdown",
+    "_safe_filename",
+    "doc_to_opml",
+    "doc_to_freeplane",
+    "markdown_to_doc",
+    "format_list",
+    "format_search",
+    # client
+    "MubuClient",
+    # cli
+    "main",
+    "_configure_logging",
+]
 
 if __name__ == "__main__":
     main()

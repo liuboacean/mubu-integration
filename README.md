@@ -29,6 +29,23 @@
 - [注意事项](#注意事项)
 - [License](#license)
 
+## 项目结构（模块化）
+
+代码按职责拆分为正式 Python 包，`scripts/mubu_api.py` 为向后兼容入口（shim）：
+
+```
+scripts/
+├── mubu_api.py        # 向后兼容 shim：重新导出 mubu 包全部公开符号；python scripts/mubu_api.py 仍可用
+└── mubu/              # 模块化包（v1.3.0 起）
+    ├── __init__.py    # 包标识（__version__）
+    ├── config.py      # 常量 / 配置 / 日志 / 异常 MubuError / 路径安全 / Token 锁
+    ├── convert.py     # 文档 ↔ Markdown / OPML / FreeMind 转换 + 展示格式化
+    ├── client.py      # MubuClient（鉴权 / 请求 / 文档·文件夹·搜索·整树导出）
+    └── cli.py         # 命令行入口 main() + 日志配置
+```
+
+> `import mubu_api` 与 `from mubu.client import MubuClient` 等包内导入方式均可使用，对外接口零破坏。
+
 ## ✨ 为什么需要它
 
 幕布是一款优秀的大纲 / 思维导图工具，但它在「自动化」和「AI 协作」上长期留白：
@@ -63,6 +80,15 @@
 | **M8 · 安全** | 🔐 凭据与路径安全 | `.env.mubu` 强制 `0o600`、移除明文参数改交互式 `getpass`、本地路径越界防护 `_safe_local_path`、API 域名白名单防 MITM |
 | **M9 · P1** | 🔍 搜索截断 + 可观测 | `search()` 返回 `truncated` 标记与防环去重；标准 `logging`+敏感脱敏+`--verbose`；401/403/5xx/网络错误 stderr 指引；CI 钉死 action SHA + Dependabot |
 | **P2 · 工程化** | ⚡ 性能与供应链 | `requests.Session` 连接复用（搜索多请求提速）、依赖拆分 `requirements.txt`+`requirements-dev.txt`、删除操作不可逆警示 |
+
+### 版本亮点（v1.3.0 · Roadmap）
+
+| 里程碑 | 能力 | 说明 |
+| :--- | :--- | :--- |
+| **Roadmap · 整树导出** | 🌳 `export-tree` | 递归导出整个文件夹树为嵌套 `.md`（子文件夹→子目录），单点失败不阻断遍历 |
+| **Roadmap · 重命名** | ✏️ `rename` | 文档走 `save_doc` name（round-trip 保内容）；文件夹走逆向推测端点 `/list/update_folder`（真实环境需验证） |
+| **Roadmap · 互操作** | 🔁 OPML / FreeMind | `opml <doc_id> --format opml\|freeplane` 导出为 OPML 2.0 / FreeMind XML，兼容 XMind 等大纲工具 |
+| **Roadmap · 大重构** | 📦 模块拆分 | `scripts/mubu_api.py` 拆分为 `scripts/mubu/`（config/convert/client/cli），shim 向后兼容，`import mubu_api` 与 `from mubu.client import MubuClient` 均可用——**93 用例通过，接口零破坏** |
 
 ## 架构与工作流程
 
@@ -226,6 +252,19 @@ python3 scripts/mubu_api.py delete <id> --yes
 # 按名称本地搜索文档/文件夹（递归遍历所有子文件夹，大小写不敏感）
 python3 scripts/mubu_api.py search "项目"
 python3 scripts/mubu_api.py search "项目" --json
+
+# 递归导出整个文件夹树为嵌套 Markdown 文件（默认当前目录，--output 指定输出根）
+python3 scripts/mubu_api.py export-tree --folder <root_folder_id> --output ./backup
+
+# 重命名文档（走 save_doc 的 name 参数，round-trip 保内容）
+python3 scripts/mubu_api.py rename <doc_id> --name "新标题" --type doc
+
+# 重命名文件夹（端点为逆向推测 /list/update_folder，真实环境需验证）
+python3 scripts/mubu_api.py rename <folder_id> --name "新文件夹名" --type folder
+
+# 导出为 OPML 2.0 / FreeMind（兼容 XMind 等其它大纲工具）
+python3 scripts/mubu_api.py opml <doc_id> --format opml
+python3 scripts/mubu_api.py opml <doc_id> --format freeplane
 ```
 
 ## Agent 触发词

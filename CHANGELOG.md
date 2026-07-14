@@ -84,11 +84,36 @@
 - 测试覆盖：**84 用例全过**（69 P0 基线 + 11 P1 + 4 P2），CI 矩阵 Python 3.9–3.12。
 - 删除操作保留 `--yes` 守卫与「不可逆」stderr 警示（无回收站，软删除待幕布 API 能力确认）。
 
+## M10 (Roadmap 实施) — 整树导出 / 重命名 / OPML·FreeMind（本期）
+
+- **整树导出**：新增 `MubuClient.export_tree(root_folder_id, output_dir, max_depth)` 与 CLI `export-tree` 子命令，递归遍历文件夹树并将每个文档写为 `<name>.md`，子文件夹创建为同级子目录；单点拉取失败不阻断整体遍历（记入 `errors` 统计）。
+- **重命名**：新增 `rename_doc(doc_id, new_name)`（走 `save_doc` 的 `name` 参数，round-trip 保内容）+ CLI `rename --type doc`；新增 `rename_folder(folder_id, new_name)` 走逆向推测端点 `/list/update_folder`（幕布无官方 API 文档，真实环境需验证），对应 CLI `rename --type folder`。
+- **OPML / FreeMind 导出**：新增模块级 `doc_to_opml(doc)` / `doc_to_freeplane(doc)` 与 CLI `opml <doc_id> --format opml|freeplane`，将幕布大纲转为 OPML 2.0 / FreeMind XML，兼容 XMind 等其它大纲工具。
+- **软删除降级说明**：幕布回收站 API 未文档化，本期维持 `delete` 硬删 + `--yes` 守卫 + 「不可逆」stderr 警示，**不实现软删除**（避免引入未经证实的 API 调用）。
+- **测试补充（+9，共 93）**：export_tree 嵌套文件生成 / 单点失败处理、rename_doc 调 save 带 name / rename_folder 走推测端点、doc_to_opml / doc_to_freeplane 合法 XML、_safe_filename 非法字符替换。全量测试 **93 用例通过**。
+- 模块拆分（单文件 → 包）已在 M11 完成。
+
+## M11 (Roadmap · 大重构) — 模块拆分（单文件 → 包，非 breaking）
+
+将单文件 `scripts/mubu_api.py` 按职责拆分为正式 Python 包 `scripts/mubu/`，`mubu_api.py` 降级为向后兼容 shim（重新导出全部公开符号），**对外接口零破坏**。
+
+- **`scripts/mubu/config.py`**：常量 / 配置（`DEFAULT_BASE_URL` / `ENDPOINTS` / 重试与搜索上限）、日志、异常 `MubuError`、路径安全 `_safe_local_path`、Token 文件锁 `_token_file_lock`、域名白名单解析。
+- **`scripts/mubu/convert.py`**：文档结构 ↔ Markdown / OPML / FreeMind 转换（`doc_to_markdown` / `export_markdown` / `markdown_to_doc` / `doc_to_opml` / `doc_to_freeplane`）与展示格式化（`_safe_filename` / `format_list` / `format_search`）。
+- **`scripts/mubu/client.py`**：`MubuClient`（鉴权 / 请求 / 文档·文件夹·搜索·整树导出）。
+- **`scripts/mubu/cli.py`**：命令行入口 `main()` + `_configure_logging()`。
+- **`scripts/mubu/__init__.py`**：包标识（`__version__ = "1.3.0"`）。
+- **`scripts/mubu_api.py`（shim）**：`from mubu.* import ...` 重新导出全部公开符号（含 `os` / `sys` / `json` / `Path` 等标准库模块级名称，保持旧调用方与既有测试兼容）；`__main__` 仍调用 `main()`。
+
+**兼容性验证**：
+- `import mubu_api` 及其公开符号（`MubuClient` / `MubuError` / `doc_to_markdown` / ...）全部可用；`python scripts/mubu_api.py <subcommand>` 行为不变。
+- 新增包内导入路径：`from mubu.client import MubuClient`、`from mubu.convert import export_markdown`、`from mubu.config import MubuError` 等均可独立使用。
+- 既有测试适配：因 `os` / `getpass` 为单例模块，`monkeypatch(mubu_api.os / mubu_api.getpass)` 仍生效；函数 / `Path` / `TOKEN_FILE` / `ENV_FILE` 的 patch 目标修正为使用点（`mubu.cli.*`、`mubu.client.TOKEN_FILE`、`mubu.client.ENV_FILE`、`mubu.config.Path`）。全量测试 **93 用例通过**（无用例增减，纯结构重构）。
+
 ## Roadmap（向前展望，尚未实现）
 
 以下为已识别、尚未排入实施的能力增强与重构方向，供后续迭代参考：
 
-- **模块拆分（排障手 #18）**：将单文件 `scripts/mubu_api.py` 按职责拆分为 `client.py` / `markdown.py` / `cli.py` / `errors.py` / `config.py`，降低单文件复杂度（属较大重构，独立排期）。
+- **模块拆分（排障手 #18）**：✅ 已在 M11 完成——`scripts/mubu_api.py` 拆分为 `scripts/mubu/`（config / convert / client / cli），`mubu_api.py` 保留为向后兼容 shim，93 用例通过。
 - **文件夹重命名 / 移动增强（产品官 #14）**：补全 `rename_folder` 等高层方法，提升目录管理能力。
 - **整树递归导出（产品官 #14）**：支持将整个文件夹树递归导出为单一 Markdown / JSON，便于整体备份。
 - **软删除 / 回收站（产品官 #14 P2）**：当前 `delete` 为永久删除（已加 `--yes` 守卫与不可逆警示）；若幕布开放回收站接口，可增加软删除通道。
