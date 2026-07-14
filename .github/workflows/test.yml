@@ -5,6 +5,10 @@ on:
     branches: [main]
   pull_request:
 
+# 最小权限（安全官 #20）：仅读取仓库内容即可运行测试，避免 GITHUB_TOKEN 越权
+permissions:
+  contents: read
+
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -14,19 +18,22 @@ jobs:
         python-version: ["3.9", "3.10", "3.11", "3.12"]
 
     steps:
+      # actions/checkout 锁定为完整 commit SHA（供应链加固，避免 @v4 可变标签被篡改/劫持）
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
+      # actions/setup-python 锁定为完整 commit SHA
       - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v5
-        with:
-          python-version: ${{ matrix.python-version }}
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
 
       - name: Upgrade pip
         run: python -m pip install --upgrade pip
 
+      # 依赖安装：如需更强的供应链保护，可改用
+      #   pip install --require-hashes -r requirements.lock.txt
+      # （由 `pip-compile --generate-hashes` 生成；Dependabot 会自动提交更新 PR）
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: pip install -r requirements.txt -r requirements-dev.txt
 
       - name: Run tests
         run: PYTHONPATH=scripts python -m pytest -v

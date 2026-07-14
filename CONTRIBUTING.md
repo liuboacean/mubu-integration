@@ -17,11 +17,14 @@
 git clone https://github.com/liuboacean/mubu-integration.git
 cd mubu-integration
 
-# 安装依赖
-pip install mubu-integration
+# 安装依赖（运行时 + 测试；开发依赖在 requirements-dev.txt）
+pip install -r requirements.txt -r requirements-dev.txt
 
-# 运行测试
-mubu --help
+# 运行全部测试（共 84 个 pytest 用例）
+PYTHONPATH=scripts python -m pytest -v
+
+# 脚本运行入口
+python3 scripts/mubu_api.py --help
 ```
 
 ## 行为准则

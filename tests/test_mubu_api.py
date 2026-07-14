@@ -15,6 +15,7 @@ import os
 import sys
 import json
 import time
+import logging
 from pathlib import Path
 from unittest import mock
 
@@ -507,7 +508,7 @@ class TestMubuErrorEnhanced:
         e = MubuError("x", status_code=400, body="short")
         assert e.body == "short"
 
-    @mock.patch("requests.request")
+    @mock.patch("requests.Session.request")
     def test_non_json_response_raises_friendly(self, mreq):
         """_request 对响应体非 JSON 时抛友好 MubuError（含 status/截断 body）。"""
         c = MubuClient(phone="p", password="w")
@@ -528,7 +529,7 @@ class TestMubuErrorEnhanced:
 # 8. M2 T5 — 网络层重试（超时 / 5xx），最多 2 次重试 = 共 3 次请求
 # --------------------------------------------------------------------------- #
 class TestNetworkRetry:
-    @mock.patch("requests.request")
+    @mock.patch("requests.Session.request")
     def test_timeout_retries_twice_then_success(self, mreq):
         c = MubuClient(phone="p", password="w")
         c.token = "t"
@@ -550,7 +551,7 @@ class TestNetworkRetry:
         assert calls["n"] == 3  # 1 首发 + 2 次重试
 
     @pytest.mark.parametrize("status", [500, 502])
-    @mock.patch("requests.request")
+    @mock.patch("requests.Session.request")
     def test_5xx_retries_then_mubuerror(self, mreq, status):
         c = MubuClient(phone="p", password="w")
         c.token = "t"
@@ -566,7 +567,7 @@ class TestNetworkRetry:
         assert isinstance(e.body, str) and len(e.body) == 200  # 截断
         assert mreq.call_count == 3  # 1 首发 + 2 次重试
 
-    @mock.patch("requests.request")
+    @mock.patch("requests.Session.request")
     def test_5xx_mixed_degrade_then_success(self, mreq):
         c = MubuClient(phone="p", password="w"); c.token = "t"
         seq = [502, 503, 200]
@@ -581,7 +582,7 @@ class TestNetworkRetry:
         assert out.status_code == 200
         assert mreq.call_count == 3
 
-    @mock.patch("requests.request")
+    @mock.patch("requests.Session.request")
     def test_connection_error_retries_then_success(self, mreq):
         c = MubuClient(phone="p", password="w"); c.token = "t"
         resp = mock.Mock(); resp.status_code = 200; resp.json.return_value = {"code": 0, "data": {}}
@@ -731,7 +732,8 @@ class TestSearch:
             match=[matchers.json_params_matcher({"folderId": "Secret Notes"})],
         )
 
-        results = isolated_client.search("project")
+        search_result = isolated_client.search("project")
+        results = search_result["results"]
         # 命中 4 项（≥3）：Project(folder)、Project Plan(doc)、
         # Project Ideas(doc)、Project Alpha(folder)
         assert len(results) >= 3
@@ -740,9 +742,11 @@ class TestSearch:
         assert ("Project Plan", "doc", "") in names
         assert ("Project Ideas", "doc", "Project") in names
         assert ("Project Alpha", "folder", "Project/Secret Notes") in names
+        # 未达上限，truncated 应为 False
+        assert search_result["truncated"] is False
 
         # 大小写不敏感
-        results_upper = isolated_client.search("PROJECT")
+        results_upper = isolated_client.search("PROJECT")["results"]
         assert len(results_upper) == len(results)
 
         # format_search 含 📁 / 📄 分区
@@ -765,11 +769,14 @@ class TestSearch:
             match=[matchers.json_params_matcher({"folderId": "0"})],
         )
 
-        results = isolated_client.search("x", limit=2)
+        search_result = isolated_client.search("x", limit=2)
+        results = search_result["results"]
         # 上限生效：只收集到 2 项（移除上限逻辑此处会变成 5 项而失败）
         assert len(results) == 2
         # 恰好是前 2 个（x0、x1），随后早返回，x2..x4 不会被收集
         assert {r["name"] for r in results} == {"x0", "x1"}
+        # 达到 limit 上限 → truncated 标记为真（结果可能不完整）
+        assert search_result["truncated"] is True
 
 
 # --------------------------------------------------------------------------- #
@@ -796,4 +803,462 @@ class TestFormatListDocsOnly:
         assert "📄 文档:" in out
 
 
+# =========================================================================== #
+# 14. 排障手 #5 — 真实 API 方法 payload 单测（请求体 JSON + 返回 id 提取）
+#     这是质量最大短板：此前 CLI 全程 mock 掉 MubuClient，真实请求体/返回解析
+#     完全无覆盖。以下用 responses 断言每个方法的请求体结构与返回 id 提取。
+# =========================================================================== #
+class TestApiMethodPayloads:
+    @responses.activate
+    def test_login_request_body_and_token_extraction(self, tmp_path, monkeypatch):
+        tok = tmp_path / "tok.json"
+        monkeypatch.setattr(mubu_api, "TOKEN_FILE", tok)
+        responses.add(
+            responses.POST, f"{BASE_URL}/user/phone_login",
+            json={"code": 0, "data": {"token": "T1", "id": "U1", "name": "alice"}},
+            status=200,
+            match=[matchers.json_params_matcher(
+                {"phone": "13800000000", "password": "pw", "callbackType": 0})],
+        )
+        c = MubuClient(phone="13800000000", password="pw")
+        info = c.login()
+        assert c.token == "T1"
+        assert info["user_id"] == "U1"
+        assert info["username"] == "alice"
+
+    @responses.activate
+    def test_create_folder_body_and_id(self, isolated_client):
+        responses.add(
+            responses.POST, f"{BASE_URL}/list/create_folder",
+            json={"code": 0, "data": {"folder": {"id": "F1"}}}, status=200,
+            match=[matchers.json_params_matcher(
+                {"folderId": "0", "name": "NewFolder"})],
+        )
+        assert isolated_client.create_folder("NewFolder", "0") == "F1"
+
+    @responses.activate
+    def test_create_doc_body_and_id(self, isolated_client):
+        responses.add(
+            responses.POST, f"{BASE_URL}/list/create_doc",
+            json={"code": 0, "data": {"doc": {"id": "D1"}}}, status=200,
+            match=[matchers.json_params_matcher(
+                {"folderId": "fid", "name": "Doc", "content": "C"})],
+        )
+        assert isolated_client.create_doc("Doc", "fid", "C") == "D1"
+
+    @responses.activate
+    def test_get_doc_body_and_return(self, isolated_client):
+        responses.add(
+            responses.POST, f"{BASE_URL}/doc/get",
+            json={"code": 0, "data": {"node": {"text": "t"}}}, status=200,
+            match=[matchers.json_params_matcher({"id": "D9"})],
+        )
+        assert isolated_client.get_doc("D9") == {"node": {"text": "t"}}
+
+    @responses.activate
+    def test_save_doc_body_with_name(self, isolated_client):
+        captured = {}
+
+        def cb(request):
+            captured["body"] = json.loads(request.body)
+            return (200, {}, json.dumps({"code": 0, "data": {}}))
+
+        responses.add_callback(responses.POST, f"{BASE_URL}/doc/save", callback=cb)
+        isolated_client.save_doc("D9", "content-here", name="Renamed")
+        assert captured["body"] == {"id": "D9", "content": "content-here", "name": "Renamed"}
+
+    @responses.activate
+    def test_save_doc_body_without_name(self, isolated_client):
+        captured = {}
+
+        def cb(request):
+            captured["body"] = json.loads(request.body)
+            return (200, {}, json.dumps({"code": 0, "data": {}}))
+
+        responses.add_callback(responses.POST, f"{BASE_URL}/doc/save", callback=cb)
+        isolated_client.save_doc("D9", "x")
+        assert captured["body"] == {"id": "D9", "content": "x"}
+        assert "name" not in captured["body"]
+
+    @responses.activate
+    def test_delete_body(self, isolated_client):
+        captured = {}
+
+        def cb(request):
+            captured["body"] = json.loads(request.body)
+            return (200, {}, json.dumps({"code": 0, "data": {}}))
+
+        responses.add_callback(responses.POST, f"{BASE_URL}/list/delete", callback=cb)
+        isolated_client.delete("D9")
+        assert captured["body"] == {"id": "D9"}
+
+    @responses.activate
+    def test_move_body(self, isolated_client):
+        captured = {}
+
+        def cb(request):
+            captured["body"] = json.loads(request.body)
+            return (200, {}, json.dumps({"code": 0, "data": {}}))
+
+        responses.add_callback(responses.POST, f"{BASE_URL}/list/move", callback=cb)
+        isolated_client.move("D9", "F2")
+        assert captured["body"] == {"id": "D9", "folderId": "F2"}
+
+
 # --------------------------------------------------------------------------- #
+# 15. 排障手 #6 — delete --yes 守卫回归（M5 整改核心）
+#     无 --yes：0 次网络调用 + sys.exit(1)；有 --yes：才调用 client.delete。
+# --------------------------------------------------------------------------- #
+class TestDeleteGuard:
+    def _write_token(self, tmp_path):
+        tok = tmp_path / "tok.json"
+        tok.write_text(json.dumps({
+            "token": "t", "user_id": "u", "username": "n",
+            "expires_at": time.time() + 3600,
+        }))
+        return tok
+
+    def _invoke(self, argv, monkeypatch, tmp_path):
+        monkeypatch.setattr(sys, "argv", ["mubu_api.py"] + argv)
+        monkeypatch.setattr(mubu_api, "TOKEN_FILE", self._write_token(tmp_path))
+        err = None
+        try:
+            mubu_api.main()
+        except SystemExit as e:
+            err = e
+        return err
+
+    @responses.activate
+    def test_delete_without_yes_exits_and_no_network(self, monkeypatch, tmp_path, capsys):
+        # 即便注册了 /list/delete mock，无 --yes 也应中止、绝不发请求
+        responses.add(responses.POST, f"{BASE_URL}/list/delete",
+                      json={"code": 0, "data": {}}, status=200)
+        err = self._invoke(["delete", "id1"], monkeypatch, tmp_path)
+        assert err is not None and err.code == 1
+        assert len(responses.calls) == 0
+        assert "不可逆" in capsys.readouterr().err
+
+    @responses.activate
+    def test_delete_with_yes_calls_api(self, monkeypatch, tmp_path):
+        responses.add(responses.POST, f"{BASE_URL}/list/delete",
+                      json={"code": 0, "data": {}}, status=200)
+        err = self._invoke(["delete", "id1", "--yes"], monkeypatch, tmp_path)
+        assert err is None
+        assert len(responses.calls) == 1
+        assert json.loads(responses.calls[0].request.body) == {"id": "id1"}
+
+
+# --------------------------------------------------------------------------- #
+# 16. P0 #1 — login CLI：移除明文参数，凭据取自环境变量 / 交互式 getpass
+# --------------------------------------------------------------------------- #
+class TestLoginCliNoPlaintextArgs:
+    def _invoke(self, argv, monkeypatch, tmp_path):
+        monkeypatch.setattr(sys, "argv", ["mubu_api.py"] + argv)
+        monkeypatch.setattr(mubu_api, "TOKEN_FILE", tmp_path / "tok.json")
+        err = None
+        try:
+            mubu_api.main()
+        except SystemExit as e:
+            err = e
+        return err
+
+    @responses.activate
+    def test_login_reads_from_env_no_cli_args(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("MUBU_PHONE", "13800000000")
+        monkeypatch.setenv("MUBU_PASSWORD", "pw")
+        responses.add(responses.POST, f"{BASE_URL}/user/phone_login",
+                      json={"code": 0, "data": {"token": "T1", "id": "U1", "name": "alice"}},
+                      status=200)
+        err = self._invoke(["login"], monkeypatch, tmp_path)
+        assert err is None
+        assert len(responses.calls) == 1
+        body = json.loads(responses.calls[0].request.body)
+        assert body == {"phone": "13800000000", "password": "pw", "callbackType": 0}
+
+    @responses.activate
+    def test_login_prompts_getpass_when_env_missing(self, monkeypatch, tmp_path, capsys):
+        monkeypatch.delenv("MUBU_PHONE", raising=False)
+        monkeypatch.delenv("MUBU_PASSWORD", raising=False)
+        responses.add(responses.POST, f"{BASE_URL}/user/phone_login",
+                      json={"code": 0, "data": {"token": "T1", "id": "U1", "name": "alice"}},
+                      status=200)
+        monkeypatch.setattr("builtins.input", lambda prompt: "13800000000")
+        monkeypatch.setattr(mubu_api.getpass, "getpass", lambda prompt: "pw")
+        err = self._invoke(["login"], monkeypatch, tmp_path)
+        assert err is None
+        body = json.loads(responses.calls[0].request.body)
+        assert body == {"phone": "13800000000", "password": "pw", "callbackType": 0}
+
+
+# --------------------------------------------------------------------------- #
+# 17. P0 #2 — _safe_local_path：拒绝绝对路径 / .. 越界 / 目录外
+# --------------------------------------------------------------------------- #
+class TestSafeLocalPath:
+    def test_relative_path_under_cwd_allowed(self):
+        # 相对路径位于当前工作目录下，应被允许（返回 Path）
+        p = mubu_api._safe_local_path("outline.md")
+        assert isinstance(p, Path)
+        assert p.name == "outline.md"
+
+    def test_absolute_path_rejected(self):
+        with pytest.raises(MubuError):
+            mubu_api._safe_local_path("/etc/passwd")
+
+    def test_dotdot_traversal_rejected(self):
+        with pytest.raises(MubuError):
+            mubu_api._safe_local_path("../secret.txt")
+
+    def test_nested_dotdot_traversal_rejected(self):
+        with pytest.raises(MubuError):
+            mubu_api._safe_local_path("a/../../secret.txt")
+
+    def test_tilde_path_expands_to_absolute_rejected(self):
+        # ~ 展开为绝对路径，应被绝对路径规则拒绝（而非静默变成 cwd 下文件）
+        with pytest.raises(MubuError):
+            mubu_api._safe_local_path("~/.ssh/id_rsa")
+
+    def test_outside_cwd_rejected(self, tmp_path):
+        # 越出 cwd 的绝对路径（即便不越级也拒绝）
+        other = tmp_path.parent / "outside.md"
+        with pytest.raises(MubuError):
+            mubu_api._safe_local_path(str(other))
+
+
+# --------------------------------------------------------------------------- #
+# 18. P1 #7 — _is_auth_error 收紧：正常业务错误不误触发重登
+# --------------------------------------------------------------------------- #
+class TestIsAuthErrorTightened:
+    def _resp(self, code):
+        r = mock.Mock()
+        r.status_code = code
+        return r
+
+    def test_normal_business_error_with_token_word_not_auth(self):
+        # 含 "token" 的普通业务错误（如"该 token 无权限"）不应触发重登
+        result = {"code": 4001, "msg": "该 token 无权限操作此文档"}
+        assert mubu_api.MubuClient._is_auth_error(mubu_api.MubuClient, result, self._resp(200)) is False
+
+    def test_explicit_login_expired_triggers(self):
+        result = {"code": 1001, "msg": "token 已过期，请重新登录"}
+        assert mubu_api.MubuClient._is_auth_error(mubu_api.MubuClient, result, self._resp(200)) is True
+
+    def test_401_always_auth(self):
+        result = {"code": 0, "msg": "ok"}
+        assert mubu_api.MubuClient._is_auth_error(mubu_api.MubuClient, result, self._resp(401)) is True
+
+
+# --------------------------------------------------------------------------- #
+# 19. P1 #2 — search() 返回结构含 truncated + 环检测
+# --------------------------------------------------------------------------- #
+class TestSearchTruncationAndCycle:
+    @responses.activate
+    def test_truncated_flag_true_when_limit_hit(self, isolated_client):
+        responses.add(
+            responses.POST, f"{BASE_URL}/list/get",
+            json={"code": 0, "data": {
+                "folders": [],
+                "docs": [{"id": f"d{i}", "name": f"x{i}"} for i in range(5)],
+            }}, status=200,
+            match=[matchers.json_params_matcher({"folderId": "0"})],
+        )
+        res = isolated_client.search("x", limit=3)
+        assert len(res["results"]) == 3
+        # 达到 limit 上限 → truncated 标记为真，调用方可知结果不完整
+        assert res["truncated"] is True
+
+    @responses.activate
+    def test_cycle_detection_no_infinite_recursion(self, isolated_client):
+        # 构造环引用：root 含文件夹 A；A 的子文件夹里又含 A 自身。
+        # visited 集合去重后 A 只被访问一次，避免无限递归。
+        call_count = {"n": 0}
+
+        def cb(request):
+            fid = (json.loads(request.body) if request.body else {}).get("folderId", "0")
+            call_count["n"] += 1
+            if fid == "0":
+                return (200, {}, json.dumps({"code": 0, "data": {
+                    "folders": [{"id": "A", "name": "A"}], "docs": []}}))
+            # A 的子文件夹里再含 A 自身 → 环
+            return (200, {}, json.dumps({"code": 0, "data": {
+                "folders": [{"id": "A", "name": "A"}],
+                "docs": [{"id": "d_loop", "name": "loopy"}]}}))
+
+        responses.add_callback(responses.POST, f"{BASE_URL}/list/get", callback=cb)
+        res = isolated_client.search("loop", max_depth=10, max_requests=200)
+        # 因 visited 去重，A 只被访问一次（root + A），不会无限递归
+        # （否则会远超 max_requests 或陷入死循环）
+        assert call_count["n"] <= 5
+        assert res["truncated"] is False
+        # 环内的 doc "loopy" 命中关键字 "loop" 仍应被收集
+        assert any(r["name"] == "loopy" for r in res["results"])
+
+
+# --------------------------------------------------------------------------- #
+# 20. P1 #1 — 错误操作指引：按 HTTP 状态码给出下一步文案
+# --------------------------------------------------------------------------- #
+class TestErrorGuidanceMessages:
+    @responses.activate
+    def test_401_message_guides_credential_check(self, isolated_client):
+        responses.add(responses.POST, f"{BASE_URL}/user/phone_login",
+                      json={"code": 0, "data": {"token": "new", "id": "u", "name": "n"}}, status=200)
+        responses.add(responses.POST, f"{BASE_URL}/list/get",
+                      json={"code": 401, "msg": "登录失效"}, status=401)
+        responses.add(responses.POST, f"{BASE_URL}/list/get",
+                      json={"code": 401, "msg": "登录失效"}, status=401)
+        with mock.patch.object(isolated_client, "login", wraps=isolated_client.login) as mlogin:
+            with pytest.raises(MubuError) as ei:
+                isolated_client.get_list("0")
+        # 401：指引用户检查凭据（重试 1 次后抛错）
+        assert "登录失效或密码错误，请检查凭据后重试" in str(ei.value)
+        assert mlogin.call_count == 1
+
+    @responses.activate
+    def test_403_message_guides_permission(self, isolated_client):
+        responses.add(responses.POST, f"{BASE_URL}/list/get",
+                      json={"code": 403, "msg": "权限不足"}, status=403)
+        with pytest.raises(MubuError) as ei:
+            isolated_client.get_list("0")
+        # 403：指引用户确认账号权限
+        assert "权限不足，请确认账号权限" in str(ei.value)
+
+    @mock.patch("requests.Session.request")
+    def test_5xx_message_guides_retry_later(self, mreq):
+        c = MubuClient(phone="p", password="w"); c.token = "t"
+        resp = mock.Mock(); resp.status_code = 503; resp.text = "x" * 500
+        mreq.return_value = resp
+        with mock.patch("time.sleep"):
+            with pytest.raises(MubuError) as ei:
+                c._http_request("POST", "http://x/api", {"h": "1"})
+        # 5xx：指引用户稍后重试
+        assert "幕布服务暂不可用，请稍后重试" in str(ei.value)
+
+    @mock.patch("requests.Session.request")
+    def test_network_error_message_guides_network_check(self, mreq):
+        c = MubuClient(phone="p", password="w"); c.token = "t"
+        mreq.side_effect = requests.exceptions.ConnectionError("conn reset")
+        with mock.patch("time.sleep"):
+            with pytest.raises(MubuError) as ei:
+                c._http_request("POST", "http://x/api", {"h": "1"})
+        # 网络异常：指引用户检查网络
+        assert "网络连接失败，请检查网络" in str(ei.value)
+
+
+# --------------------------------------------------------------------------- #
+# 21. P1 #3 — 移除冗余 ensure_login()：高层方法仅走 auth=True
+# --------------------------------------------------------------------------- #
+class TestEnsureLoginRedundantRemoved:
+    @responses.activate
+    def test_create_folder_does_not_call_ensure_login(self, isolated_client):
+        responses.add(responses.POST, f"{BASE_URL}/list/create_folder",
+                      json={"code": 0, "data": {"folder": {"id": "F1"}}}, status=200,
+                      match=[matchers.json_params_matcher(
+                          {"folderId": "0", "name": "NewFolder"})])
+        with mock.patch.object(isolated_client, "ensure_login",
+                              wraps=isolated_client.ensure_login) as mel:
+            assert isolated_client.create_folder("NewFolder", "0") == "F1"
+        # 冗余的 ensure_login() 已移除：仅由 _request(auth=True) 内部处理
+        assert mel.call_count == 0
+
+    @responses.activate
+    def test_get_list_still_works_without_ensure_login(self, isolated_client):
+        responses.add(responses.POST, f"{BASE_URL}/list/get",
+                      json={"code": 0, "data": {"folders": [], "docs": []}}, status=200)
+        with mock.patch.object(isolated_client, "ensure_login",
+                              wraps=isolated_client.ensure_login) as mel:
+            isolated_client.get_list("0")
+        assert mel.call_count == 0
+
+
+# --------------------------------------------------------------------------- #
+# 22. P1 #16 — 日志规范：分级 + 敏感信息脱敏
+# --------------------------------------------------------------------------- #
+class TestLoggingSanitization:
+    def test_sensitive_data_not_logged(self, monkeypatch):
+        # 明文密码仅出现在 login 请求体，绝不进入日志
+        buf = __import__("io").StringIO()
+        handler = logging.StreamHandler(buf)
+        handler.setFormatter(logging.Formatter("%(message)s"))
+        mubu_api.logger.addHandler(handler)
+        mubu_api.logger.setLevel(logging.DEBUG)
+        try:
+            monkeypatch.setenv("MUBU_PASSWORD", "SUPER_SECRET_PW")
+            with mock.patch("requests.Session.request") as mreq:
+                resp = mock.Mock(); resp.status_code = 200
+                resp.json.return_value = {"code": 1, "msg": "密码错误"}
+                mreq.return_value = resp
+                c = MubuClient()
+                with pytest.raises(MubuError):
+                    c.login()
+            log_text = buf.getvalue()
+            # 日志中不应出现明文密码（仅记录 msg，不记录请求体/响应体）
+            assert "SUPER_SECRET_PW" not in log_text
+        finally:
+            mubu_api.logger.removeHandler(handler)
+
+    def test_verbose_enables_debug(self, capsys):
+        mubu_api._configure_logging(verbose=True)
+        assert mubu_api.logger.level == logging.DEBUG
+        mubu_api.logger.debug("DBG_MARKER")
+        assert "DBG_MARKER" in capsys.readouterr().err
+        mubu_api._configure_logging(verbose=False)
+        assert mubu_api.logger.level == logging.WARNING
+
+
+# --------------------------------------------------------------------------- #
+# 23. P1 #1 — examples/weekly.md 示例大纲可被正确解析
+# --------------------------------------------------------------------------- #
+class TestExamples:
+    def test_weekly_md_exists_and_parses(self):
+        example = REPO_ROOT / "examples" / "weekly.md"
+        assert example.exists(), "examples/weekly.md 缺失"
+        doc = markdown_to_doc(example.read_text(encoding="utf-8"))
+        # 顶层标题作为 root，且至少含一个子节点
+        assert doc["node"]["text"]
+        assert len(doc["node"].get("children", [])) >= 1
+
+
+# --------------------------------------------------------------------------- #
+# 24. P2 #22 — 复用 requests.Session 连接池
+# --------------------------------------------------------------------------- #
+class TestSessionReuse:
+    def test_client_holds_requests_session(self):
+        c = MubuClient(phone="p", password="w")
+        assert isinstance(c._session, requests.Session)
+
+    @mock.patch("requests.Session.request")
+    def test_session_request_is_reused(self, mreq):
+        c = MubuClient(phone="p", password="w")
+        c.token = "t"
+        resp = mock.Mock()
+        resp.status_code = 200
+        resp.json.return_value = {"code": 0, "data": {}}
+        mreq.return_value = resp
+        c._http_request("POST", "http://x/api", {"h": "1"})
+        c._http_request("POST", "http://x/api", {"h": "1"})
+        # 两次调用都走同一个 session.request（连接池复用）
+        assert mreq.call_count == 2
+
+
+# --------------------------------------------------------------------------- #
+# 25. P2 #21 — 依赖拆分（运行时 / 开发分离）
+# --------------------------------------------------------------------------- #
+class TestRequirementsSplit:
+    def test_requirements_dev_exists(self):
+        dev = REPO_ROOT / "requirements-dev.txt"
+        assert dev.exists(), "requirements-dev.txt 应存在（开发依赖独立拆分）"
+        text = dev.read_text(encoding="utf-8")
+        assert "pytest" in text
+        assert "responses" in text
+        # responses 应带上限，避免意外大版本跃迁
+        assert "<1" in text
+
+    def test_runtime_requirements_has_only_requests(self):
+        rt = REPO_ROOT / "requirements.txt"
+        text = rt.read_text(encoding="utf-8")
+        assert "requests" in text
+        assert "pytest" not in text
+        assert "responses" not in text
+
+
+# --------------------------------------------------------------------------- #
+

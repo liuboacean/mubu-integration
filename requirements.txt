@@ -1,6 +1,2 @@
-# 运行时依赖
+# 运行时依赖（仅运行时需要，开发/测试依赖见 requirements-dev.txt）
 requests>=2.32.4,<3
-
-# 测试 / 开发依赖（CI 直接 pip install -r 使用）
-pytest>=8.3.5,<9
-responses>=0.25

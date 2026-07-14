@@ -1,0 +1,17 @@
+version: 2
+updates:
+  # GitHub Actions：每周检查并更新 actions/*（含 SHA 重钉提示）
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    # 仅提交更新 PR（SHA 钉死由人工 review 确认，避免自动改 SHA 引入供应链风险）
+    open-pull-requests-limit: 10
+
+  # pip 依赖：每周检查并提交 requirements.txt 更新 PR
+  # （后续可在更新 PR 中启用 `pip install --require-hashes`）
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 10

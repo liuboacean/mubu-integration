@@ -23,10 +23,13 @@ import re
 import sys
 import json
 import time
+import logging
+import getpass
 import argparse
 import requests
 from pathlib import Path
 from contextlib import contextmanager
+from urllib.parse import urlparse
 try:
     import fcntl
 except ImportError:
@@ -34,8 +37,52 @@ except ImportError:
 from typing import Optional, Dict, List, Any, Tuple, Iterator
 
 # fcntl 跨进程 advisory 锁：Unix 用 fcntl.flock；无 fcntl 平台（Windows 等）降级为无操作（P2-6）
+
+# --------------------------------------------------------------------------- #
+# 日志（P1 #16）：用 logging 取代散落的 print；warning/error 分级，
+# --verbose 控制 debug；敏感内容（密码 / token）绝不进日志——只记录 msg，
+# 不记录请求体 / 响应体（body 已有 200 字符截断，见 MubuError）。
+# --------------------------------------------------------------------------- #
+logger = logging.getLogger("mubu_api")
+logger.propagate = False  # 不外传至 root，避免重复输出
+if not logger.handlers:
+    # 默认 stderr 处理器（导入期或尚未经 main() 配置时也能输出 warning/error）
+    _default_handler = logging.StreamHandler(sys.stderr)
+    _default_handler.setFormatter(logging.Formatter("%(levelname)s: %(message)s"))
+    logger.addHandler(_default_handler)
+logger.setLevel(logging.WARNING)
+
 # API 基础配置
-BASE_URL = "https://api2.mubu.com/v3/api"
+# 默认 base URL；允许通过环境变量 MUBU_BASE_URL 覆盖，但仅限 mubu.com 家族域名，
+# 防止指向恶意服务器造成 MITM / 凭据泄漏（安全官 #8）。
+DEFAULT_BASE_URL = "https://api2.mubu.com/v3/api"
+ALLOWED_BASE_HOSTS = ("api2.mubu.com", "api.mubu.com", "mubu.com")
+
+
+def _resolve_base_url() -> str:
+    """解析 base URL：优先 MUBU_BASE_URL，但仅接受 mubu.com 家族域名。
+
+    域名不在白名单时拒绝覆盖、回退默认并 stderr 告警（不静默信任），
+    避免攻击者通过环境变量将流量导向伪造服务器。
+    """
+    env_url = os.getenv("MUBU_BASE_URL")
+    if not env_url:
+        return DEFAULT_BASE_URL
+    try:
+        host = urlparse(env_url).hostname or ""
+    except Exception:
+        host = ""
+    if host in ALLOWED_BASE_HOSTS:
+        return env_url.rstrip("/")
+    logger.warning(
+        "MUBU_BASE_URL 域名 '%s' 不在允许列表（仅限 mubu.com 家族），"
+        "已忽略并使用默认地址 %s",
+        host, DEFAULT_BASE_URL,
+    )
+    return DEFAULT_BASE_URL
+
+
+BASE_URL = _resolve_base_url()
 TOKEN_FILE = Path.home() / ".mubu_token"
 
 # .env 凭据文件路径：仅当环境变量未设置时用于补全 MUBU_PHONE / MUBU_PASSWORD
@@ -81,6 +128,40 @@ MAX_SEARCH_DEPTH = 3
 MAX_SEARCH_LIMIT = 50
 # 整个搜索的 HTTP 请求数硬上限（get_list 调用次数）
 MAX_SEARCH_REQUESTS = 200
+
+
+def _safe_local_path(path: str) -> Path:
+    """校验并解析本地文件路径，仅允许当前工作目录或其子目录（安全官 #3）。
+
+    拒绝绝对路径、``..`` 越界路径、以及跳出当前工作目录的路径，防止
+    ``create --md`` / ``save --file`` 读取 ``/etc/passwd``、``~/.ssh/id_rsa``
+    等任意文件并外发。校验失败抛 MubuError（清晰错误，而非原始栈）。
+
+    Args:
+        path: 用户传入的文件路径（来自 CLI --md / --file）
+
+    Returns:
+        解析后的绝对 Path（位于允许目录内）
+
+    Raises:
+        MubuError: 路径非法（绝对 / 越界 / 跳出允许目录）
+    """
+    # 0) 展开 ~ 为用户目录（如 ~/.ssh/id_rsa → /Users/.../.ssh/id_rsa），
+    #    展开后若为绝对路径将在下一步被明确拒绝，避免被静默解析为 cwd 下文件。
+    path = os.path.expanduser(path)
+    # 1) 拒绝越界片段（.. 跳出目录层级）
+    parts = [p for p in path.replace("\\", "/").split("/") if p not in ("", ".")]
+    if ".." in parts:
+        raise MubuError(f"拒绝越界路径（包含 '..'）: {path}")
+    # 2) 拒绝绝对路径
+    if os.path.isabs(path):
+        raise MubuError(f"拒绝读取绝对路径（可能越权访问系统文件）: {path}")
+    # 3) 解析后的真实路径必须位于当前工作目录内（含其自身，symlink 已被 realpath 展开）
+    resolved = os.path.realpath(path)
+    cwd = os.path.realpath(os.getcwd())
+    if resolved != cwd and not resolved.startswith(cwd + os.sep):
+        raise MubuError(f"拒绝访问允许目录（当前工作目录）之外的文件: {path}")
+    return Path(resolved)
 
 
 # Token 文件跨进程 advisory 锁（P2-6）：Unix 用 fcntl.flock；无 fcntl 平台降级为无操作
@@ -136,6 +217,8 @@ class MubuClient:
         self.user_id = None
         self.username = None
         self.expires_at = 0  # Token 过期时间戳（秒）
+        # P2 #22：复用 requests.Session 连接池，search 多请求场景下避免每次新建连接
+        self._session = requests.Session()
         self._load_token()
 
     def _load_env_file(self, path: Optional[Path] = None) -> None:
@@ -151,6 +234,11 @@ class MubuClient:
         env_path = path or ENV_FILE
         if not env_path.exists():
             return
+        # 安全官 #1：凭据文件仅属主可读写，加载时强制 600（失败不影响加载）
+        try:
+            os.chmod(env_path, 0o600)
+        except Exception:
+            pass
         try:
             for line in env_path.read_text(encoding="utf-8").splitlines():
                 line = line.strip()
@@ -233,9 +321,11 @@ class MubuClient:
         code = result.get("code")
         if code is not None and code != 0:
             msg = str(result.get("msg", "")).lower()
+            # 收紧关键字：仅保留明确指向登录失效的短语，移除 "token"/"auth"/
+            # "expire"/"login"/"过期" 等易出现在正常业务错误中的泛化词，
+            # 避免误触发重登、掩盖真实错误（排障手 #7 / 安全官）
             auth_keywords = (
-                "登录", "login", "token", "未登录", "过期",
-                "expire", "auth", "unauthorized", "重新登录"
+                "登录", "未登录", "重新登录", "登录失效", "unauthorized"
             )
             if any(k in msg for k in auth_keywords):
                 return True
@@ -254,7 +344,9 @@ class MubuClient:
         last_err: Optional[Exception] = None
         for attempt in range(MAX_NETWORK_RETRIES + 1):
             try:
-                response = requests.request(
+                logger.debug("HTTP %s %s (attempt=%s, timeout=%ss)",
+                             method, url, attempt + 1, REQUEST_TIMEOUT)
+                response = self._session.request(
                     method, url, headers=headers, timeout=REQUEST_TIMEOUT, **kwargs
                 )
             except requests.exceptions.RequestException as e:
@@ -264,7 +356,7 @@ class MubuClient:
                     time.sleep(NETWORK_BACKOFF[min(attempt, len(NETWORK_BACKOFF) - 1)])
                     continue
                 raise MubuError(
-                    f"网络请求失败（已重试 {MAX_NETWORK_RETRIES} 次）: {e}",
+                    f"网络连接失败，请检查网络（已重试 {MAX_NETWORK_RETRIES} 次）: {e}",
                     status_code=None,
                 )
 
@@ -275,8 +367,8 @@ class MubuClient:
                     time.sleep(NETWORK_BACKOFF[min(attempt, len(NETWORK_BACKOFF) - 1)])
                     continue
                 raise MubuError(
-                    f"服务端错误（HTTP {response.status_code}），已重试 "
-                    f"{MAX_NETWORK_RETRIES} 次仍失败",
+                    f"幕布服务暂不可用，请稍后重试（HTTP {response.status_code}，"
+                    f"已重试 {MAX_NETWORK_RETRIES} 次仍失败）",
                     status_code=response.status_code,
                     body=response.text,
                 )
@@ -286,7 +378,7 @@ class MubuClient:
 
         # 理论不可达：兜底抛错，避免漏掉 last_err
         raise MubuError(
-            f"网络请求失败（已耗尽重试）: {last_err or '未知错误'}",
+            f"网络请求失败（非预期）: {last_err or '未知错误'}",
             status_code=None,
         )
 
@@ -309,6 +401,7 @@ class MubuClient:
         if auth:
             self.ensure_valid_token()
 
+        logger.debug("请求 %s %s (auth=%s)", method, endpoint, auth)
         url = f"{BASE_URL}{endpoint}"
         headers = self._get_headers()
         if "headers" in kwargs:
@@ -333,14 +426,23 @@ class MubuClient:
             if max_retries > 0:
                 self.login()
                 return self._request(method, endpoint, max_retries=max_retries - 1, auth=auth, **kwargs)
+            # 401 或登录失效类错误，重试后仍失败 → 给出下一步操作指引
             raise MubuError(
-                f"鉴权失败且重试后仍失败: {result.get('msg', '未知错误')}",
+                f"登录失效或密码错误，请检查凭据后重试"
+                f"（{result.get('msg', '未知错误')}）",
                 status_code=response.status_code,
                 body=result,
             )
 
         if result.get("code") != 0:
             # 403 权限不足或其它业务错误，不触发重登
+            if response.status_code == 403:
+                raise MubuError(
+                    f"权限不足，请确认账号权限"
+                    f"（{result.get('msg', '未知错误')}）",
+                    status_code=response.status_code,
+                    body=result,
+                )
             raise MubuError(
                 f"API 错误: {result.get('msg', '未知错误')}",
                 status_code=response.status_code,
@@ -379,13 +481,11 @@ class MubuClient:
 
     def get_list(self, folder_id: str = "0") -> List[Dict]:
         """获取文件夹下的文档和子文件夹列表"""
-        self.ensure_login()
         data = self._request(*ENDPOINTS["list"], json={"folderId": folder_id})
         return data
 
     def create_folder(self, name: str, parent_id: str = "0") -> str:
         """创建文件夹"""
-        self.ensure_login()
         data = self._request(*ENDPOINTS["create_folder"], json={
             "folderId": parent_id,
             "name": name
@@ -394,7 +494,6 @@ class MubuClient:
 
     def create_doc(self, name: str, folder_id: str = "0", content: str = "") -> str:
         """创建文档"""
-        self.ensure_login()
         data = self._request(*ENDPOINTS["create_doc"], json={
             "folderId": folder_id,
             "name": name,
@@ -404,12 +503,10 @@ class MubuClient:
 
     def get_doc(self, doc_id: str) -> Dict:
         """获取文档内容"""
-        self.ensure_login()
         return self._request(*ENDPOINTS["get_doc"], json={"id": doc_id})
 
     def save_doc(self, doc_id: str, content: str, name: Optional[str] = None) -> None:
         """保存文档"""
-        self.ensure_login()
         data = {"id": doc_id, "content": content}
         if name:
             data["name"] = name
@@ -417,12 +514,10 @@ class MubuClient:
 
     def delete(self, item_id: str) -> None:
         """删除文档或文件夹"""
-        self.ensure_login()
         self._request(*ENDPOINTS["delete"], json={"id": item_id})
 
     def move(self, item_id: str, target_folder_id: str) -> None:
         """移动文档到其他文件夹"""
-        self.ensure_login()
         self._request(*ENDPOINTS["move"], json={
             "id": item_id,
             "folderId": target_folder_id
@@ -431,16 +526,20 @@ class MubuClient:
     def search(self, keyword: str, root_folder_id: str = "0",
                max_depth: int = MAX_SEARCH_DEPTH,
                limit: int = MAX_SEARCH_LIMIT,
-               max_requests: int = MAX_SEARCH_REQUESTS) -> List[Dict[str, Any]]:
+               max_requests: int = MAX_SEARCH_REQUESTS) -> Dict[str, Any]:
         """本地递归搜索：名称包含关键字的文档与文件夹（T6，M4 T2 增强）。
 
         mubu 无公开 /search 端点，从根文件夹开始递归遍历所有子文件夹，
         收集 name 包含 keyword（大小写不敏感）的条目。
 
-        三项上限均静默截断（不抛异常、不打断返回）：
+        为保护调用方，到达以下任一上限即停止遍历并标记 truncated=True
+        （不再静默丢失信息，调用方据此知晓结果可能不完整）：
         - max_depth: 递归深度上限（根 depth=0，默认 3 即最多展开 4 层）
         - limit: 返回结果总数上限
         - max_requests: 整个搜索的 get_list 请求数硬上限
+
+        环检测：已访问的 folder_id 进入 visited 集合，遇到重复引用直接跳过，
+        防止幕布返回环引用时无限递归（max_requests 之上的第二道防线）。
 
         Args:
             keyword: 搜索关键字（大小写不敏感）
@@ -450,15 +549,22 @@ class MubuClient:
             max_requests: 搜索总请求数硬上限
 
         Returns:
-            匹配项列表，每项含 id / name / type（"doc" | "folder"）/ path（从根起的路径）
+            字典 {"results": [...], "truncated": bool, "limit": int, "max_depth": int}
+            - results: 匹配项列表，每项含 id / name / type（"doc" | "folder"）
+              / path（从根起的路径）
+            - truncated: 是否因达到上限而提前结束（结果可能不完整）
         """
         keyword_lower = (keyword or "").lower()
         results: List[Dict[str, Any]] = []
         req_count = 0
         truncated = False
+        visited: set = set()  # 已访问 folder_id，防环引用无限递归
 
         def walk(folder_id: str, path: str, depth: int) -> None:
             nonlocal req_count, truncated
+            if folder_id in visited:
+                return  # 已访问，去重（防环）
+            visited.add(folder_id)
             if truncated or depth > max_depth or req_count >= max_requests:
                 if depth > max_depth or req_count >= max_requests:
                     truncated = True
@@ -467,7 +573,7 @@ class MubuClient:
                 data = self.get_list(folder_id)
             except MubuError as e:
                 # 单个文件夹拉取失败不阻断整体遍历
-                print(f"警告: 遍历文件夹 {folder_id} 失败: {e}", file=sys.stderr)
+                logger.warning("遍历文件夹 %s 失败: %s", folder_id, e)
                 return
             req_count += 1
             if len(results) >= limit:
@@ -493,7 +599,12 @@ class MubuClient:
                 walk(f.get("id"), child_path, depth + 1)
 
         walk(root_folder_id, "", 0)
-        return results
+        return {
+            "results": results,
+            "truncated": truncated,
+            "limit": limit,
+            "max_depth": max_depth,
+        }
 
 
 def doc_to_markdown(node: Dict[str, Any], level: int = 0) -> str:
@@ -723,14 +834,35 @@ def format_search(results: List[Dict]) -> str:
     return "\n".join(lines)
 
 
+def _configure_logging(verbose: bool) -> None:
+    """配置 mubu_api 日志（P1 #16）。
+
+    每次运行前清理旧 handler，避免跨进程 / 跨测试绑定到失效的 stderr
+    （capsys 场景：每轮测试替换 sys.stderr，handler 必须重绑当前对象）。
+    - 默认 WARNING：仅输出 warning / error
+    - --verbose：DEBUG，输出请求级调试信息
+    """
+    for h in list(logger.handlers):
+        logger.removeHandler(h)
+    # 绑定当前 sys.stderr（capsys 生效时为捕获对象，确保测试可断言）
+    handler = logging.StreamHandler(sys.stderr)
+    handler.setFormatter(logging.Formatter("%(levelname)s: %(message)s"))
+    logger.addHandler(handler)
+    logger.setLevel(logging.DEBUG if verbose else logging.WARNING)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="幕布 API 命令行工具")
+    # P1 #16：--verbose 控制 debug 日志（默认仅 warning/error）
+    parser.add_argument("--verbose", action="store_true",
+                        help="输出调试日志（DEBUG 级别，含请求级信息）")
     subparsers = parser.add_subparsers(dest="command", help="可用命令")
 
-    # 登录
-    login_parser = subparsers.add_parser("login", help="登录幕布")
-    login_parser.add_argument("--phone", help="手机号")
-    login_parser.add_argument("--password", help="密码")
+    # 登录（凭据取自环境变量 / ~/.workbuddy/.env.mubu；缺失时交互式输入，
+    # 不再提供 --phone/--password 明文参数，避免出现在 ps / shell 历史中）
+    login_parser = subparsers.add_parser(
+        "login", help="登录幕布（凭据取自环境变量 / .env.mubu，缺失时交互式输入）"
+    )
 
     # 列表
     list_parser = subparsers.add_parser("list", help="获取文档列表")
@@ -783,18 +915,28 @@ def main() -> None:
     search_parser.add_argument("--json", action="store_true", help="JSON 格式输出")
 
     args = parser.parse_args()
+    _configure_logging(args.verbose)
 
     if not args.command:
         parser.print_help()
         return
 
     try:
-        client = MubuClient(
-            phone=getattr(args, "phone", None),
-            password=getattr(args, "password", None)
-        )
+        client = MubuClient()
 
         if args.command == "login":
+            # 凭据优先来自环境变量 / .env.mubu；缺失时交互式输入
+            # （无明文 CLI 参数，避免 ps / shell 历史泄露）
+            if not client.phone:
+                try:
+                    client.phone = input("请输入幕布手机号: ").strip()
+                except EOFError:
+                    pass
+            if not client.password:
+                try:
+                    client.password = getpass.getpass("请输入幕布密码: ")
+                except EOFError:
+                    pass
             result = client.login()
             print(f"登录成功: {result['username']} (ID: {result['user_id']})")
 
@@ -810,8 +952,10 @@ def main() -> None:
             print(f"创建文件夹成功: {folder_id}")
 
         elif args.command == "create":
-            if getattr(args, "md", None):
-                content = json.dumps(markdown_to_doc(Path(args.md).read_text(encoding="utf-8")), ensure_ascii=False)
+            md_path = getattr(args, "md", None)
+            if md_path:
+                safe = _safe_local_path(md_path)
+                content = json.dumps(markdown_to_doc(safe.read_text(encoding="utf-8")), ensure_ascii=False)
             else:
                 content = args.content
             doc_id = client.create_doc(args.name, args.folder, content)
@@ -825,10 +969,14 @@ def main() -> None:
                 print(export_markdown(doc))
 
         elif args.command == "save":
-            if getattr(args, "md", None):
-                content = json.dumps(markdown_to_doc(Path(args.md).read_text(encoding="utf-8")), ensure_ascii=False)
-            elif args.file:
-                content = Path(args.file).read_text(encoding="utf-8")
+            md_path = getattr(args, "md", None)
+            file_path = args.file
+            if md_path:
+                safe = _safe_local_path(md_path)
+                content = json.dumps(markdown_to_doc(safe.read_text(encoding="utf-8")), ensure_ascii=False)
+            elif file_path:
+                safe = _safe_local_path(file_path)
+                content = safe.read_text(encoding="utf-8")
             elif args.content:
                 content = args.content
             else:
@@ -841,10 +989,9 @@ def main() -> None:
             # 未显式传 --yes 时，打印不可逆警示并 sys.exit(1) 中止，
             # 绝不调用 client.delete(...)；仅当 args.yes 为真才执行删除。
             if not args.yes:
-                print(
-                    f"⚠️ 删除不可逆：即将删除幕布文档/文件夹 {args.id}。"
-                    f"确认请加 --yes 重新执行。",
-                    file=sys.stderr,
+                logger.warning(
+                    "删除不可逆：即将删除幕布文档/文件夹 %s。确认请加 --yes 重新执行。",
+                    args.id,
                 )
                 sys.exit(1)
             client.delete(args.id)
@@ -855,18 +1002,26 @@ def main() -> None:
             print(f"移动成功: {args.item_id} -> {args.target}")
 
         elif args.command == "search":
-            results = client.search(
+            result = client.search(
                 args.keyword,
                 max_depth=args.max_depth,
                 limit=args.limit,
             )
+            results = result["results"]
+            # 结果因达到上限被截断时，提示调用方结果可能不完整
+            if result.get("truncated"):
+                logger.warning(
+                    "搜索因达到上限（limit=%s）而提前结束，结果可能不完整",
+                    result.get("limit"),
+                )
             if args.json:
                 print(json.dumps(results, indent=2, ensure_ascii=False))
             else:
                 print(format_search(results))
 
     except Exception as e:
-        print(f"错误: {e}", file=sys.stderr)
+        # 仅记录 msg（已脱敏：不含密码/token/原始 body），不泄露敏感信息
+        logger.error("%s", e)
         sys.exit(1)
 
 
