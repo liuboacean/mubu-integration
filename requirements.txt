@@ -1,2 +1,2 @@
 # 运行时依赖（仅运行时需要，开发/测试依赖见 requirements-dev.txt）
-requests>=2.32.4,<3
+requests>=2.34.2,<3
