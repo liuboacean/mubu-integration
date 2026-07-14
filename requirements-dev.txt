@@ -1,3 +1,3 @@
 # 测试 / 开发依赖（不参与运行时；CI 用 `pip install -r requirements-dev.txt` 安装）
 pytest>=8.3.5,<9
-responses>=0.25,<1
+responses>=0.26.2,<1
