@@ -183,6 +183,21 @@
 - 已知限制: `save_doc` / `rename_doc` 真机写回需服务端对该客户端放行（反爬签名），目前端到端落库不可达
 - 依赖/破坏性：无破坏性变更
 
+## M15 (Roadmap · 软删除/锁文件) — 本地回收站软删除 + pip-tools 依赖锁文件（2026-07-15）
+
+- feat: `delete` 改为本地软删除——仅将文档标记写入 `~/.workbuddy/.mubu_trash.json`，**零网络调用**，云端副本保留；新增 `restore <id>`（仅移除本地标记、零风险）、`purge <id> --yes`（真实服务端删除 + 移除标记，不可逆）、`trash`（列出回收站项）；`list` / `search` 默认过滤已软删项，新增 `--include-trash` 可包含。
+- feat: 引入 pip-tools 锁文件——新增 `requirements.in`（requests）/ `requirements-dev.in`（pytest, responses），`requirements.txt` / `requirements-dev.txt` 重写为 `pip-compile --generate-hashes` 精确锁定 + 哈希；CI 新增锁文件漂移校验步骤。
+- docs: README / SKILL 版本号 → 1.3.5、新增软删除 / 回收站章节、安装说明改锁定文件、`delete` 不再标记为「不可逆」（仅 `purge --yes` 为不可逆）。
+- test: 100 passed（迁移 `test_delete_with_yes_calls_api` → `test_delete_with_yes_marks_trash`（0 网络 + 校验回收站写入），新增 `TestTrash`：restore / purge --yes 调 API / list 过滤 / search 过滤 + `--include-trash` 反例）。
+- 已知限制: 锁文件在本机 Python 3.13 解释器上生成（pip-tools 7.5.3 已移除 `--python-version` / `--check` flag）；锁定版本 requests 2.34.2 / pytest 9.1.1 / responses 0.26.2 及其传递依赖均支持 CI 的 3.9–3.12 矩阵，非阻塞。
+- 依赖/破坏性：无破坏性变更（注意 `delete` 语义由「永久删除」变为「本地软删除」，属行为变更但保留 `--yes` 守卫）。
+
+## v1.3.5（本期发布版本 · 2026-07-15）
+
+本期为本地回收站软删除（restore / purge / trash）+ pip-tools 依赖锁文件（GitHub tag v1.3.5）。详见上方 M15。
+
+- 依赖/破坏性：无破坏性变更（`delete` 语义由「永久删除」变为「本地软删除」，保留 `--yes` 守卫；`purge --yes` 为唯一不可逆操作）
+
 ## Roadmap（向前展望，尚未实现）
 
 以下为已识别、尚未排入实施的能力增强与重构方向，供后续迭代参考：
