@@ -128,6 +128,28 @@
 - **move 已知未验证**：保留原实现并标注待抓包确认。
 - 测试覆盖：**93 用例全过**，无任何端点相关回归。
 
+## M13 (Roadmap · 真机验证) — get_list 字段名修正 + get_doc 待抓包（2026-07-15）
+
+用真实账号实测 `list` / `search` / `export-tree` 时发现隐藏缺陷并修正：
+
+- **get_list 字段名修正（关键 latent bug）**：代码与测试均假设 `get_list` 返回文档列表字段为 `docs`，但幕布真机返回的是 **`documents`**（带 s）。导致 `list` / `export-tree` / `search` / `format_list` 在真机上**读不到任何文档**（单元测试因 mock 同样用 `docs` 键而假绿，93 用例全过却掩盖了真机失效）。
+  - 修复：`client.export_tree` / `client.search` / `convert.format_list` 统一改为读取 `data.get("documents")`，并保留对旧 `docs` 键的兜底兼容（防御字段名变化）。
+  - 测试：将 `test_documents_key_is_ignored`（错误假设「忽略 documents 键」）改为 `test_documents_key_is_used`（验证 documents 被正确读取 + 兼容 docs），使测试真正反映真机结构。
+  - 真机验证：`search("三级等保")` 命中 1 个文档（修复前 0）、根目录文档总数读到 **80 个**（修复前 0）。
+- **get_doc 端点不可用（待抓包）**：`get_doc`（`POST /doc/get`）在真机对所有文档（含新建文档）均返回 `code 17 illegal request`；额外探测 `/doc/detail` / `/doc/info` / `/doc/open` / `/doc/load` / `/doc/getContent` / `/list/doc` 等 11 个变体**全部 illegal request**。文档正文获取机制与当前端点对不上，需浏览器 DevTools 抓包确认幕布真实的文档加载 API 后才能修复。
+  - **影响**：`export-tree`（导出正文）、`rename_doc`（依赖 get_doc）当前真机不可用；两者均已有 try/except 优雅降级（export_tree 记 errors 继续，不会崩溃）。`list` / `search`（仅列目录）已恢复可用。
+- **move 仍待验证**：同 M12，真实端点未知，保留原实现并标注待抓包。
+- 测试覆盖：**93 用例全过**，docs/documents 修复零回归。
+
+## v1.3.2（本期发布版本 · 2026-07-15）
+
+本期合并发布 **M13（get_list 字段名修正）**，修复 `list` / `search` / `format_list` 在真机上读不到文档的隐藏缺陷（GitHub tag v1.3.2）。
+
+- **list / search 真机可用**：统一读取 `documents` 字段（兼容旧 `docs`）。
+- **export-tree / rename_doc 正文功能暂不可用**：因 `get_doc`（`/doc/get`）真机返回 illegal request，待抓包确认文档加载 API 后修复；列目录能力正常。
+- **move 已知未验证**：保留原实现并标注待抓包确认。
+- 测试覆盖：**93 用例全过**。
+
 ## Roadmap（向前展望，尚未实现）
 
 以下为已识别、尚未排入实施的能力增强与重构方向，供后续迭代参考：

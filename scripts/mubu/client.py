@@ -409,7 +409,7 @@ class MubuClient:
                 stats["errors"] += 1
                 return
             folders = data.get("folders", []) or []
-            docs = data.get("docs", []) or []
+            docs = data.get("documents") or data.get("docs") or []
             for d in docs:
                 doc_id = d.get("id")
                 name = (d.get("name") or "untitled").strip()
@@ -490,7 +490,7 @@ class MubuClient:
                 truncated = True
                 return
             folders = data.get("folders", []) or []
-            docs = data.get("docs", []) or []
+            docs = data.get("documents") or data.get("docs") or []
             for d in docs:
                 name = d.get("name") or ""
                 if keyword_lower and keyword_lower in name.lower():

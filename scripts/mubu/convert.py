@@ -245,12 +245,12 @@ def markdown_to_doc(md: str) -> Dict[str, Any]:
 def format_list(data: Dict) -> str:
     """格式化文档列表为可读文本。
 
-    T5：仅使用 docs 键（data.get("docs")），与 get_list 返回结构对齐，
-    移除对 documents 键的兜底。
+    真机 get_list 返回文档列表字段为 ``documents``；旧版/个别环境可能用 ``docs``，
+    此处优先读 ``documents`` 并兜底 ``docs``，避免真机上读不到文档。
     """
     lines = []
-    folders = data.get("folders", [])
-    docs = data.get("docs", [])
+    folders = data.get("folders", []) or []
+    docs = data.get("documents") or data.get("docs") or []
 
     if folders:
         lines.append("📁 文件夹:")

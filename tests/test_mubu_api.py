@@ -787,17 +787,18 @@ class TestSearch:
 
 
 # --------------------------------------------------------------------------- #
-# 13. M2 T5 — format_list 仅使用 docs（移除 documents 兜底）
+# 13. M2 T5 — format_list 读取 documents 字段（真机返回），兼容旧 docs 兜底
 # --------------------------------------------------------------------------- #
 class TestFormatListDocsOnly:
-    def test_documents_key_is_ignored(self):
+    def test_documents_key_is_used(self):
+        # 真机 get_list 返回 documents 字段，format_list 必须正确读取
         data = {
             "folders": [{"id": "f1", "name": "F"}],
             "documents": [{"id": "d1", "name": "D"}],
         }
         out = mubu_api.format_list(data)
-        assert "D" not in out            # documents 被忽略
-        assert "📄 文档:" not in out      # 无 docs 时不渲染文档区
+        assert "D" in out                 # documents 被读取
+        assert "📄 文档:" in out          # 渲染文档区
         assert "F" in out                 # folders 正常渲染
 
     def test_docs_rendered_normally(self):
