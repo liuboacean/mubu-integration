@@ -895,8 +895,8 @@ class TestApiMethodPayloads:
             captured["body"] = json.loads(request.body)
             return (200, {}, json.dumps({"code": 0, "data": {}}))
 
-        responses.add_callback(responses.POST, f"{BASE_URL}/list/delete", callback=cb)
-        isolated_client.delete("D9")
+        responses.add_callback(responses.POST, f"{BASE_URL}/list/delete_folder", callback=cb)
+        isolated_client.delete_folder("D9")
         assert captured["body"] == {"id": "D9"}
 
     @responses.activate
@@ -937,8 +937,8 @@ class TestDeleteGuard:
 
     @responses.activate
     def test_delete_without_yes_exits_and_no_network(self, monkeypatch, tmp_path, capsys):
-        # 即便注册了 /list/delete mock，无 --yes 也应中止、绝不发请求
-        responses.add(responses.POST, f"{BASE_URL}/list/delete",
+        # 即便注册了 /list/delete_folder mock，无 --yes 也应中止、绝不发请求
+        responses.add(responses.POST, f"{BASE_URL}/list/delete_folder",
                       json={"code": 0, "data": {}}, status=200)
         err = self._invoke(["delete", "id1"], monkeypatch, tmp_path)
         assert err is not None and err.code == 1
@@ -947,7 +947,7 @@ class TestDeleteGuard:
 
     @responses.activate
     def test_delete_with_yes_calls_api(self, monkeypatch, tmp_path):
-        responses.add(responses.POST, f"{BASE_URL}/list/delete",
+        responses.add(responses.POST, f"{BASE_URL}/list/delete_folder",
                       json={"code": 0, "data": {}}, status=200)
         err = self._invoke(["delete", "id1", "--yes"], monkeypatch, tmp_path)
         assert err is None
@@ -1328,9 +1328,11 @@ class TestRename:
         mreq.assert_called_once()
         args, kwargs = mreq.call_args
         assert args[0] == "POST"
-        assert args[1] == "/list/update_folder"
+        assert args[1] == "/list/rename_folder"
         assert kwargs["json"]["id"] == "f1"
         assert kwargs["json"]["name"] == "Renamed"
+        # 真机验证：folderId 必须填文件夹自身 id，不能填 "0"
+        assert kwargs["json"]["folderId"] == "f1"
 
 
 class TestOpmlFreeplane:

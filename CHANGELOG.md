@@ -109,6 +109,25 @@
 - 新增包内导入路径：`from mubu.client import MubuClient`、`from mubu.convert import export_markdown`、`from mubu.config import MubuError` 等均可独立使用。
 - 既有测试适配：因 `os` / `getpass` 为单例模块，`monkeypatch(mubu_api.os / mubu_api.getpass)` 仍生效；函数 / `Path` / `TOKEN_FILE` / `ENV_FILE` 的 patch 目标修正为使用点（`mubu.cli.*`、`mubu.client.TOKEN_FILE`、`mubu.client.ENV_FILE`、`mubu.config.Path`）。全量测试 **93 用例通过**（无用例增减，纯结构重构）。
 
+## M12 (Roadmap · 真机验证 + 端点修正) — rename_folder / delete 实测修正（2026-07-15）
+
+用真实幕布账号逐端点实测，修正此前逆向推测的多处错误写端点：
+
+- **rename_folder 修正（关键）**：原 `/list/update_folder` 实测返回 `code 17 illegal request`。正确端点为 **`POST /list/rename_folder`**，且必须同时携带 `id` 与 `folderId`，**`folderId` 必须填文件夹自身真实 id（不能填根目录魔法值 `"0"`，否则 `code 5`）**。已用真实账号验证改名生效（建临时文件夹 → 改名 → 回查确认 → 删除，无残留）。
+- **delete 修正（关键 latent bug）**：原 `delete` 走 `/list/delete` 实测返回 `code 17 illegal request`。正确端点须按类型区分：**`/list/delete_folder`**（文件夹）、**`/list/delete_doc`**（文档），均 `{"id": ...}`。已拆为 `delete_folder()` / `delete_doc()`，`delete(item_id, item_type="folder")` 兼容分发；CLI `delete` 新增 `--type doc|folder`（默认 folder）。
+- **move 仍待验证**：`/list/move` 及多种变体（`move_folder` / `move_doc` / 不同字段名 `folderId`/`toFolderId`/`parentId`/`targetId`）实测均返回 `illegal request`，真实端点未知。本期**不改动 move 代码**，标记为「未实测验证待抓包」，待浏览器 DevTools 抓包确认正确端点后再修。
+- **测试适配（+0 用例，仍为 93）**：`test_rename_folder_uses_update_endpoint` 改为断言 `/list/rename_folder` + `folderId`；`test_delete_*` 三个用例 mock URL 由 `/list/delete` 改为 `/list/delete_folder`。全量 **93 用例通过**。
+- 账号清理：验证过程产生的临时文件夹均已通过 `delete_folder` 删除，无残留。
+
+## v1.3.1（本期发布版本 · 2026-07-15）
+
+本期合并发布 **M12（真机验证 + 端点修正）**，构成自 v1.3.0 以来的关键正确性修复（GitHub tag v1.3.1）。
+
+- **rename_folder 真机可用**：端点 `/list/rename_folder`，`folderId` 填自身 id。
+- **delete 真机可用**：拆分 `delete_folder` / `delete_doc`（原 `/list/delete` 为错误端点）；CLI `delete` 加 `--type`。
+- **move 已知未验证**：保留原实现并标注待抓包确认。
+- 测试覆盖：**93 用例全过**，无任何端点相关回归。
+
 ## Roadmap（向前展望，尚未实现）
 
 以下为已识别、尚未排入实施的能力增强与重构方向，供后续迭代参考：

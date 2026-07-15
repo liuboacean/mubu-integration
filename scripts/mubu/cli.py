@@ -86,6 +86,8 @@ def main() -> None:
     # 删除
     delete_parser = subparsers.add_parser("delete", help="删除文档或文件夹")
     delete_parser.add_argument("id", help="文档或文件夹ID")
+    delete_parser.add_argument("--type", choices=["doc", "folder"], default="folder",
+                               help="对象类型：doc=文档 / folder=文件夹（默认 folder）")
     # Medium×3 修复：不可逆操作必须显式 --yes 才执行，否则 CLI 层中止。
     delete_parser.add_argument("--yes", action="store_true",
                                help="确认执行不可逆删除（必须显式传参）")
@@ -202,11 +204,11 @@ def main() -> None:
             # 绝不调用 client.delete(...)；仅当 args.yes 为真才执行删除。
             if not args.yes:
                 logger.warning(
-                    "删除不可逆：即将删除幕布文档/文件夹 %s。确认请加 --yes 重新执行。",
-                    args.id,
+                    "删除不可逆：即将删除幕布%s %s。确认请加 --yes 重新执行。",
+                    "文档" if args.type == "doc" else "文件夹", args.id,
                 )
                 sys.exit(1)
-            client.delete(args.id)
+            client.delete(args.id, args.type)
             print("删除成功")
 
         elif args.command == "move":

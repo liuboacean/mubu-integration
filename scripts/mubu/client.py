@@ -339,9 +339,23 @@ class MubuClient:
             data["name"] = name
         self._request(*ENDPOINTS["save_doc"], json=data)
 
-    def delete(self, item_id: str) -> None:
-        """删除文档或文件夹"""
-        self._request(*ENDPOINTS["delete"], json={"id": item_id})
+    def delete_folder(self, folder_id: str) -> None:
+        """删除文件夹（已真机验证：POST /list/delete_folder，body {"id": ...}）。"""
+        self._request(*ENDPOINTS["delete_folder"], json={"id": folder_id})
+
+    def delete_doc(self, doc_id: str) -> None:
+        """删除文档（已真机验证：POST /list/delete_doc，body {"id": ...}）。"""
+        self._request(*ENDPOINTS["delete_doc"], json={"id": doc_id})
+
+    def delete(self, item_id: str, item_type: str = "folder") -> None:
+        """删除文档或文件夹（按类型分发，默认 folder）。
+
+        兼容旧调用；新代码建议直接用 delete_folder / delete_doc。
+        """
+        if item_type == "doc":
+            self.delete_doc(item_id)
+        else:
+            self.delete_folder(item_id)
 
     def move(self, item_id: str, target_folder_id: str) -> None:
         """移动文档到其他文件夹"""
@@ -360,14 +374,15 @@ class MubuClient:
         self.save_doc(doc_id, content, name=new_name)
 
     def rename_folder(self, folder_id: str, new_name: str) -> None:
-        """重命名文件夹。
+        """重命名文件夹（已真机验证：POST /list/rename_folder）。
 
-        注意：本端点为逆向推测（社区已知 /list/update_folder），幕布未提供官方 API 文档。
-        真实环境需验证；若端点/字段不符，将抛出 MubuError。
+        实测幕布要求同时携带 ``id`` 与 ``folderId``，且 ``folderId`` 必须填文件夹
+        **自身真实 id**（不能填根目录魔法值 ``"0"``，否则返回 code 5）。``name`` 为新名称。
         """
-        self._request("POST", "/list/update_folder", json={
+        self._request("POST", "/list/rename_folder", json={
             "id": folder_id,
-            "name": new_name
+            "name": new_name,
+            "folderId": folder_id,
         })
 
     def export_tree(self, root_folder_id: str = "0", output_dir: str = ".",

@@ -80,7 +80,11 @@ ENDPOINTS = {
     "create_doc": ("POST", "/list/create_doc"),
     "get_doc": ("POST", "/doc/get"),
     "save_doc": ("POST", "/doc/save"),
-    "delete": ("POST", "/list/delete"),
+    # 真机验证（2026-07-15）：删除必须区分类型，且端点为 delete_folder / delete_doc，
+    # 原推测的 /list/delete 实测返回 code 17 illegal request。
+    "delete_folder": ("POST", "/list/delete_folder"),
+    "delete_doc": ("POST", "/list/delete_doc"),
+    # move 端点尚未经真机验证（返回 illegal request），保留原推测值，待抓包确认
     "move": ("POST", "/list/move"),
 }
 

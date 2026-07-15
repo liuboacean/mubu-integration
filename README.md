@@ -86,7 +86,7 @@ scripts/
 | 里程碑 | 能力 | 说明 |
 | :--- | :--- | :--- |
 | **Roadmap · 整树导出** | 🌳 `export-tree` | 递归导出整个文件夹树为嵌套 `.md`（子文件夹→子目录），单点失败不阻断遍历 |
-| **Roadmap · 重命名** | ✏️ `rename` | 文档走 `save_doc` name（round-trip 保内容）；文件夹走逆向推测端点 `/list/update_folder`（真实环境需验证） |
+| **Roadmap · 重命名** | ✏️ `rename` | 文档走 `save_doc` name（round-trip 保内容）；文件夹走已验证端点 `/list/rename_folder`（`folderId` 填自身 id） |
 | **Roadmap · 互操作** | 🔁 OPML / FreeMind | `opml <doc_id> --format opml\|freeplane` 导出为 OPML 2.0 / FreeMind XML，兼容 XMind 等大纲工具 |
 | **Roadmap · 大重构** | 📦 模块拆分 | `scripts/mubu_api.py` 拆分为 `scripts/mubu/`（config/convert/client/cli），shim 向后兼容，`import mubu_api` 与 `from mubu.client import MubuClient` 均可用——**93 用例通过，接口零破坏** |
 
@@ -246,8 +246,9 @@ python3 scripts/mubu_api.py save <doc_id> --md outline.md
 # 移动文档到其他文件夹
 python3 scripts/mubu_api.py move <doc_id> --target <folder_id>
 
-# 删除（⚠️ 不可逆，执行前务必确认目标 ID；CLI 需显式 --yes 才会真正删除）
-python3 scripts/mubu_api.py delete <id> --yes
+# 删除（⚠️ 不可逆，执行前务必确认目标 ID；必须显式 --yes；--type 默认 folder）
+python3 scripts/mubu_api.py delete <id> --type folder --yes
+python3 scripts/mubu_api.py delete <doc_id> --type doc --yes
 
 # 按名称本地搜索文档/文件夹（递归遍历所有子文件夹，大小写不敏感）
 python3 scripts/mubu_api.py search "项目"
@@ -259,7 +260,7 @@ python3 scripts/mubu_api.py export-tree --folder <root_folder_id> --output ./bac
 # 重命名文档（走 save_doc 的 name 参数，round-trip 保内容）
 python3 scripts/mubu_api.py rename <doc_id> --name "新标题" --type doc
 
-# 重命名文件夹（端点为逆向推测 /list/update_folder，真实环境需验证）
+# 重命名文件夹（已真机验证端点 /list/rename_folder，folderId 填自身 id）
 python3 scripts/mubu_api.py rename <folder_id> --name "新文件夹名" --type folder
 
 # 导出为 OPML 2.0 / FreeMind（兼容 XMind 等其它大纲工具）
