@@ -78,7 +78,7 @@ ENDPOINTS = {
     "list": ("POST", "/list/get"),
     "create_folder": ("POST", "/list/create_folder"),
     "create_doc": ("POST", "/list/create_doc"),
-    "get_doc": ("POST", "/doc/get"),
+    "get_doc": ("POST", "/document/edit/get"),
     "save_doc": ("POST", "/doc/save"),
     # 真机验证（2026-07-15）：删除必须区分类型，且端点为 delete_folder / delete_doc，
     # 原推测的 /list/delete 实测返回 code 17 illegal request。

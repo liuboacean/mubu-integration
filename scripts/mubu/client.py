@@ -123,7 +123,7 @@ class MubuClient:
         """获取带认证的请求头"""
         headers = DEFAULT_HEADERS.copy()
         if self.token:
-            headers["jwt-token"] = self.token
+            headers["Jwt-Token"] = self.token
         return headers
 
     def ensure_valid_token(self) -> None:
@@ -329,8 +329,16 @@ class MubuClient:
         return data.get("doc", {}).get("id", "")
 
     def get_doc(self, doc_id: str) -> Dict:
-        """获取文档内容"""
-        return self._request(*ENDPOINTS["get_doc"], json={"id": doc_id})
+        """获取文档内容（正文大纲）。返回 {"name":..., "nodes":[...]}。"""
+        self.ensure_login()
+        data = self._request(*ENDPOINTS["get_doc"], json={
+            "docId": doc_id,
+            "password": "",
+            "isFromDocDir": True,
+        })
+        # 真实响应：data.definition 是 JSON 字符串，需二次解析为 {"nodes":[...]}
+        definition = json.loads(data["definition"])
+        return {"name": data.get("name"), "nodes": definition.get("nodes", [])}
 
     def save_doc(self, doc_id: str, content: str, name: Optional[str] = None) -> None:
         """保存文档"""

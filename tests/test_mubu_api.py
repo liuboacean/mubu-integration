@@ -856,12 +856,26 @@ class TestApiMethodPayloads:
 
     @responses.activate
     def test_get_doc_body_and_return(self, isolated_client):
+        # 修复后：端点 /document/edit/get，body {docId, password, isFromDocDir}
+        # 返回 data.definition（JSON 字符串）→ 二次解析为 nodes
+        definition = json.dumps({
+            "nodes": [
+                {"id": "n1", "text": "一级", "children": [],
+                 "collapsed": False, "finish": False},
+            ]
+        })
         responses.add(
-            responses.POST, f"{BASE_URL}/doc/get",
-            json={"code": 0, "data": {"node": {"text": "t"}}}, status=200,
-            match=[matchers.json_params_matcher({"id": "D9"})],
+            responses.POST, f"{BASE_URL}/document/edit/get",
+            json={"code": 0, "data": {"name": "文档标题", "definition": definition}},
+            status=200,
+            match=[matchers.json_params_matcher(
+                {"docId": "D9", "password": "", "isFromDocDir": True})],
         )
-        assert isolated_client.get_doc("D9") == {"node": {"text": "t"}}
+        assert isolated_client.get_doc("D9") == {
+            "name": "文档标题",
+            "nodes": [{"id": "n1", "text": "一级", "children": [],
+                       "collapsed": False, "finish": False}],
+        }
 
     @responses.activate
     def test_save_doc_body_with_name(self, isolated_client):

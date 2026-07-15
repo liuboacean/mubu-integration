@@ -33,9 +33,9 @@ def doc_to_markdown(node: Dict[str, Any], level: int = 0) -> str:
     text = (node.get("text") or "").replace("\n", " ")
     indent = " " * (2 * level)
 
-    # 勾选状态（mark 为单个字符 x / 空格）
-    if node.get("checked") is not None:
-        mark = "x" if node.get("checked") else " "
+    # 勾选状态：兼容旧版 checked 与真实 API 的 finish（布尔）
+    if node.get("checked") is not None or node.get("finish") is not None:
+        mark = "x" if (node.get("checked") or node.get("finish")) else " "
         lines.append(f"{indent}- [{mark}] {text}")
     else:
         lines.append(f"{indent}- {text}")
@@ -53,10 +53,15 @@ def doc_to_markdown(node: Dict[str, Any], level: int = 0) -> str:
 
 
 def export_markdown(doc: Dict[str, Any]) -> str:
-    """将文档 data 层转换为 Markdown 文本。
+    """将文档结构转换为 Markdown 文本。
+
+    兼容两种输入形状（get_doc 修复后引入真实 API 形状，需向后兼容旧往返形状）：
+    - 真实 API（get_doc 修复后返回）：{"name":..., "nodes":[顶层节点...]}
+      mubu 文档通常只有一个顶层节点，其 text 即文档标题，children 为大纲正文。
+    - 本地往返（markdown_to_doc 返回）：{"node":{...}} 或裸 {"text":..., "children":[...]}
 
     Args:
-        doc: get_doc() 返回的 data 层，结构 {"node": {"text":..., "children":[...]}}
+        doc: 文档结构（见上两种形状）
 
     Returns:
         Markdown 文本（首行为 '# 标题'）
@@ -64,6 +69,21 @@ def export_markdown(doc: Dict[str, Any]) -> str:
     Raises:
         MubuError: 文档结构无效（既无有效 text 也无 children）时
     """
+    # 新形状：真实 API 的 nodes 顶层数组（优先）
+    nodes = doc.get("nodes")
+    if nodes:
+        lines: List[str] = []
+        for node in nodes:
+            title = (node.get("text") or "").replace("\n", " ")
+            lines.append(f"# {title}")
+            for child in node.get("children") or []:
+                lines.append(doc_to_markdown(child, level=0))
+            note = node.get("note")
+            if note:
+                lines.append(f"> {note}")
+        return "\n".join(lines)
+
+    # 旧形状：markdown_to_doc 的单一 node（或裸 node）
     root = doc.get("node") or doc
     if not isinstance(root, dict) or (not root.get("text") and not root.get("children")):
         raise MubuError("无效的文档结构")
