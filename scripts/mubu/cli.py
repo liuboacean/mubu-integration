@@ -169,7 +169,11 @@ def main() -> None:
             md_path = getattr(args, "md", None)
             if md_path:
                 safe = _safe_local_path(md_path)
-                content = json.dumps(markdown_to_doc(safe.read_text(encoding="utf-8")), ensure_ascii=False)
+                # create_doc 的 content 同样是 definition JSON 字符串 {"nodes":[...]}，
+                # 与 get_doc 返回的 nodes 同构；markdown_to_doc 返回 {"node":{...}}，
+                # 此处取其根节点包成单顶层节点的 definition。
+                md_doc = markdown_to_doc(safe.read_text(encoding="utf-8"))
+                content = json.dumps({"nodes": [md_doc.get("node")]}, ensure_ascii=False)
             else:
                 content = args.content
             doc_id = client.create_doc(args.name, args.folder, content)
@@ -187,7 +191,11 @@ def main() -> None:
             file_path = args.file
             if md_path:
                 safe = _safe_local_path(md_path)
-                content = json.dumps(markdown_to_doc(safe.read_text(encoding="utf-8")), ensure_ascii=False)
+                # save_doc 的 content 必须是 definition JSON 字符串 {"nodes":[...]}，
+                # 与 get_doc 返回的 nodes 同构；markdown_to_doc 返回 {"node":{...}}，
+                # 此处取其根节点包成单顶层节点的 definition。
+                md_doc = markdown_to_doc(safe.read_text(encoding="utf-8"))
+                content = json.dumps({"nodes": [md_doc.get("node")]}, ensure_ascii=False)
             elif file_path:
                 safe = _safe_local_path(file_path)
                 content = safe.read_text(encoding="utf-8")

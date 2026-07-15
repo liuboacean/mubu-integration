@@ -341,7 +341,28 @@ class MubuClient:
         return {"name": data.get("name"), "nodes": definition.get("nodes", [])}
 
     def save_doc(self, doc_id: str, content: str, name: Optional[str] = None) -> None:
-        """保存文档"""
+        """保存/更新文档内容。
+
+        Args:
+            doc_id: 文档 ID
+            content: 文档正文，必须是 **definition JSON 字符串**，即
+                ``json.dumps({"nodes": [...]}, ensure_ascii=False)`` —— 与 get_doc
+                返回的 ``nodes`` 同构（幕布大纲节点数组）。
+                注意：不要传纯 Markdown 文本，也不要传 get_doc 的整体返回值
+                ``{"name":..., "nodes":...}``（那是带 name 的包装，不是 definition）。
+            name: 可选，更新文档名称（作为顶层字段与 content 并列发送）。
+
+        注意：真机验证显示 POST /doc/save 对来自本客户端的请求一律返回
+        ``code:17 / illegal request``（其它写接口如 create_doc 正常）。续跑排障手
+        （v1.3.4 收尾）已逐一排除 payload 因素：分别试过 ``{id,content}``、
+        ``{id,content,name}``、``{id,definition}``、``{id,content,name,cover}``、
+        以及把整体 ``{"name":...,"nodes":...}`` 当 content 包回去共 5 种 body，
+        全部同样报 illegal request；客户端已带浏览器 UA / Origin / Referer。
+        由此定位根因为**幕布对该接口启用了服务端请求签名/反爬校验**，与请求体
+        形状无关——本方法发出的 ``{"id","content"}`` 即为正确契约形态，无法在
+        客户端侧绕过该签名。端到端 round-trip 当前不可达，但调用方只要传正确的
+        definition JSON 字符串（见 content 说明）即符合接口契约。
+        """
         data = {"id": doc_id, "content": content}
         if name:
             data["name"] = name
@@ -376,9 +397,13 @@ class MubuClient:
         """重命名文档（基于现有 save_doc 的 name 参数）。
 
         先拉取文档内容，再用 save_doc 回写并携带新名称，实现 round-trip 重命名。
+
+        回写的正文必须是 definition JSON 字符串（``{"nodes": [...]}``），与
+        get_doc 返回的 ``nodes`` 同构；不要直接 ``json.dumps(doc)``（那会得到带
+        ``name`` 的包装 ``{"name":..., "nodes":...}``，不是幕布接受的 definition 形状）。
         """
         doc = self.get_doc(doc_id)
-        content = json.dumps(doc, ensure_ascii=False)
+        content = json.dumps({"nodes": doc["nodes"]}, ensure_ascii=False)
         self.save_doc(doc_id, content, name=new_name)
 
     def rename_folder(self, folder_id: str, new_name: str) -> None:

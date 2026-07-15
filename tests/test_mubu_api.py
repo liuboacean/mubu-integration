@@ -1326,7 +1326,8 @@ class TestExportTree:
 class TestRename:
     def test_rename_doc_calls_save_with_name(self):
         client = MubuClient()
-        doc = {"node": {"text": "Old", "children": []}}
+        # get_doc 真实返回形状 {"name", "nodes":[...]}（与 rename_doc 内部依赖一致）
+        doc = {"name": "Old", "nodes": [{"text": "Old", "children": []}]}
         with mock.patch.object(client, "get_doc", return_value=doc) as mget, \
              mock.patch.object(client, "save_doc") as msave:
             client.rename_doc("d1", "New Name")
@@ -1334,6 +1335,27 @@ class TestRename:
         msave.assert_called_once()
         args, kwargs = msave.call_args
         assert "d1" in args
+        assert kwargs.get("name") == "New Name"
+
+    def test_rename_doc_sends_definition_shape(self):
+        """回归：rename_doc 回写的 content 必须是 definition JSON 字符串
+        {"nodes": [...]}（与 get_doc 返回的 nodes 同构），而非带 name 的
+        get_doc 整体包装 {"name":..., "nodes":...}。"""
+        client = MubuClient()
+        doc = {
+            "name": "Old",
+            "nodes": [
+                {"id": "n1", "text": "A", "children": [{"id": "n2", "text": "B"}]},
+            ],
+        }
+        with mock.patch.object(client, "get_doc", return_value=doc), \
+             mock.patch.object(client, "save_doc") as msave:
+            client.rename_doc("d1", "New Name")
+        args, kwargs = msave.call_args
+        content = json.loads(args[1])
+        # 必须是纯 definition 形状，不能含 "name" 包装
+        assert content == {"nodes": doc["nodes"]}
+        assert "name" not in content
         assert kwargs.get("name") == "New Name"
 
     def test_rename_folder_uses_update_endpoint(self):
@@ -1383,6 +1405,56 @@ class TestOpmlFreeplane:
         assert "<node" in xml
         root = ET.fromstring(xml)
         assert root.tag == "map"
+
+    def _sample_nodes_doc(self):
+        # 真实 get_doc 返回形状：{"name":..., "nodes":[顶层节点...]}
+        return {
+            "name": "MyDoc",
+            "nodes": [
+                {
+                    "text": "Root",
+                    "children": [
+                        {"text": "A", "children": [{"text": "A1"}]},
+                        {"text": "B", "note": "hello"},
+                    ],
+                },
+            ],
+        }
+
+    def test_doc_to_opml_nodes_shape(self):
+        import xml.etree.ElementTree as ET
+
+        # 回归真实 API 形状 {"nodes":[...]} 的渲染（双形状优先分支）
+        xml = doc_to_opml(self._sample_nodes_doc())
+        assert xml.startswith("<?xml")
+        root = ET.fromstring(xml)
+        assert root.tag == "opml"
+        body = root.find("body")
+        assert body is not None
+        top_outlines = list(body)
+        # 每个顶层 node 成为 <body> 下的一个 <outline>
+        assert len(top_outlines) == 1
+        assert top_outlines[0].get("text") == "Root"
+        outlines = [e for e in root.iter("outline")]
+        # Root + A + A1 + B = 4 个 outline，且 note 保留
+        assert len(outlines) == 4
+        assert any(o.get("_note") == "hello" for o in outlines)
+
+    def test_doc_to_freeplane_nodes_shape(self):
+        import xml.etree.ElementTree as ET
+
+        # 回归真实 API 形状 {"nodes":[...]} 的渲染：nodes[0] 作为根 <node>
+        xml = doc_to_freeplane(self._sample_nodes_doc())
+        assert xml.startswith("<?xml")
+        root = ET.fromstring(xml)
+        assert root.tag == "map"
+        root_node = root.find("node")
+        assert root_node is not None
+        assert root_node.get("text") == "Root"
+        children = list(root_node)
+        # nodes[0].children = [A, B] 成为根 node 的直接子节点
+        assert len(children) == 2
+        assert {c.get("text") for c in children} == {"A", "B"}
 
 
 class TestSafeFilename:
