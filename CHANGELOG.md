@@ -150,6 +150,28 @@
 - **move 已知未验证**：保留原实现并标注待抓包确认。
 - 测试覆盖：**93 用例全过**。
 
+## M14 (Roadmap · 真机验证) — get_doc 真实端点与 definition 解析修复（2026-07-15）
+
+用真实幕布账号抓包确认 `get_doc` 文档加载机制并修复（M13 标记为待抓包）：
+
+- get_doc 端点由错误 `/doc/get` 修正为真实 `POST /document/edit/get`。
+- 请求体由 `{"id":...}` 修正为 `{"docId":..., "password":"", "isFromDocDir":true}`。
+- 响应 `data.definition` 为 JSON 字符串，二次解析为 `{"nodes":[...]}`；`get_doc` 现返回 `{"name":..., "nodes":[...]}`（与旧 `{"node":{...}}` 形状不同）。
+- `convert.export_markdown` 支持新 `nodes` 形状（保留旧 `node` 形状向后兼容）；`doc_to_markdown` 支持真实 `finish` 勾选态渲染为 `- [x]` / `- [ ]`。
+- SKILL.md 校正 get_doc 端点（`POST /document/edit/get`）、`Jwt-Token` 请求头、移除不存在的 `refresh_token 30天` 描述。
+- 无破坏性变更；93 用例全过。
+
+## v1.3.3（本期发布版本 · 2026-07-15）
+
+本期合并发布 **M14（get_doc 真实端点与 definition 解析修复）**，修复文档正文获取在真机上失效的问题（GitHub tag v1.3.3）。
+
+- fix: `get_doc` 改用真实端点 `POST /document/edit/get`（原 `/doc/get` 为错误端点，导致取不到文档）
+- fix: 请求体改为 `{"docId":..., "password":"", "isFromDocDir":true}`（原 `{"id":...}` 错误）
+- fix: 解析响应 `data.definition`（JSON 字符串）为 `{"nodes":[...]}`，`get_doc` 现返回 `{"name":..., "nodes":[...]}`
+- fix: `convert.export_markdown` 支持新 `nodes` 形状（保留旧 `node` 形状向后兼容）；`doc_to_markdown` 支持真实 `finish` 勾选态渲染为 `- [x]`/`- [ ]`
+- docs: SKILL.md 校正 get_doc 端点、`Jwt-Token` 请求头、移除不存在的 `refresh_token 30天` 描述
+- 依赖/破坏性：无破坏性变更
+
 ## Roadmap（向前展望，尚未实现）
 
 以下为已识别、尚未排入实施的能力增强与重构方向，供后续迭代参考：

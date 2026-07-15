@@ -85,28 +85,31 @@ for r in results:
 
 ```json
 {
-  "node": {
-    "id": "root",
-    "text": "文档标题",
-    "children": [
-      {
-        "id": "node_1",
-        "text": "一级标题",
-        "children": [
-          {
-            "id": "node_1_1",
-            "text": "二级标题",
-            "children": []
-          }
-        ]
-      },
-      {
-        "id": "node_2",
-        "text": "另一个一级标题",
-        "children": []
-      }
-    ]
-  }
+  "name": "文档标题",
+  "nodes": [
+    {
+      "id": "node_1",
+      "text": "一级标题",
+      "children": [
+        {
+          "id": "node_1_1",
+          "text": "二级标题",
+          "children": []
+        }
+      ],
+      "collapsed": false,
+      "finish": false,
+      "modified": 0
+    },
+    {
+      "id": "node_2",
+      "text": "另一个一级标题",
+      "children": [],
+      "collapsed": false,
+      "finish": false,
+      "modified": 0
+    }
+  ]
 }
 ```
 
