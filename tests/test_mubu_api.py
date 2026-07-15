@@ -943,6 +943,8 @@ class TestDeleteGuard:
     def _invoke(self, argv, monkeypatch, tmp_path):
         monkeypatch.setattr(sys, "argv", ["mubu_api.py"] + argv)
         monkeypatch.setattr(mubu.client, "TOKEN_FILE", self._write_token(tmp_path))
+        # v1.3.5：软删除回收站写入 TRASH_FILE，测试必须隔离到 tmp 路径
+        monkeypatch.setattr(mubu.client, "TRASH_FILE", tmp_path / "trash.json")
         err = None
         try:
             mubu_api.main()
@@ -958,16 +960,134 @@ class TestDeleteGuard:
         err = self._invoke(["delete", "id1"], monkeypatch, tmp_path)
         assert err is not None and err.code == 1
         assert len(responses.calls) == 0
-        assert "不可逆" in capsys.readouterr().err
+        # v1.3.5：delete 改为软删除，警示文案改为「回收站」相关
+        assert "回收站" in capsys.readouterr().err
 
     @responses.activate
-    def test_delete_with_yes_calls_api(self, monkeypatch, tmp_path):
+    def test_delete_with_yes_marks_trash(self, monkeypatch, tmp_path):
+        # v1.3.5：软删除——即便注册了 delete_folder mock，--yes 也只写回收站、
+        # 绝不调用服务端（0 次网络请求），且 TRASH_FILE 出现 id1 键。
         responses.add(responses.POST, f"{BASE_URL}/list/delete_folder",
                       json={"code": 0, "data": {}}, status=200)
         err = self._invoke(["delete", "id1", "--yes"], monkeypatch, tmp_path)
         assert err is None
+        assert len(responses.calls) == 0
+        trash = json.loads((tmp_path / "trash.json").read_text())
+        assert "id1" in trash
+
+
+class TestTrash:
+    """v1.3.5 软删除 / 本地回收站：restore / purge / list&search 过滤。"""
+
+    def _write_token(self, tmp_path):
+        tok = tmp_path / "tok.json"
+        tok.write_text(json.dumps({
+            "token": "t", "user_id": "u", "username": "n",
+            "expires_at": time.time() + 3600,
+        }))
+        return tok
+
+    def _invoke(self, argv, monkeypatch, tmp_path):
+        monkeypatch.setattr(sys, "argv", ["mubu_api.py"] + argv)
+        monkeypatch.setattr(mubu.client, "TOKEN_FILE", self._write_token(tmp_path))
+        # 软删除回收站写入 TRASH_FILE，必须隔离到 tmp 路径
+        monkeypatch.setattr(mubu.client, "TRASH_FILE", tmp_path / "trash.json")
+        err = None
+        try:
+            mubu_api.main()
+        except SystemExit as e:
+            err = e
+        return err
+
+    @responses.activate
+    def test_restore_removes_trash(self, monkeypatch, tmp_path):
+        # 预写回收站快照，restore 应移除 id1 标记（零服务端调用）
+        trash = tmp_path / "trash.json"
+        trash.write_text(json.dumps({"id1": {
+            "id": "id1", "type": "doc", "name": "x", "parent_id": "0",
+            "deleted_at": "2026-01-01T00:00:00",
+        }}))
+        err = self._invoke(["restore", "id1"], monkeypatch, tmp_path)
+        assert err is None
+        data = json.loads(trash.read_text())
+        assert "id1" not in data
+
+    @responses.activate
+    def test_purge_requires_yes_and_calls_api(self, monkeypatch, tmp_path):
+        # 预写回收站快照（folder 类型）
+        trash = tmp_path / "trash.json"
+        trash.write_text(json.dumps({"id1": {
+            "id": "id1", "type": "folder", "name": "x", "parent_id": "0",
+            "deleted_at": "2026-01-01T00:00:00",
+        }}))
+        responses.add(responses.POST, f"{BASE_URL}/list/delete_folder",
+                      json={"code": 0, "data": {}}, status=200)
+        # 无 --yes → 退出码 1，且 0 次网络请求（彻底删除被守卫拦下）
+        err = self._invoke(["purge", "id1"], monkeypatch, tmp_path)
+        assert err is not None and err.code == 1
+        assert len(responses.calls) == 0
+        # 有 --yes → 恰好 1 次服务端调用，且回收站 id1 被移除
+        err = self._invoke(["purge", "id1", "--yes"], monkeypatch, tmp_path)
+        assert err is None
         assert len(responses.calls) == 1
-        assert json.loads(responses.calls[0].request.body) == {"id": "id1"}
+        data = json.loads(trash.read_text())
+        assert "id1" not in data
+
+    @responses.activate
+    def test_list_filters_trashed(self, monkeypatch, tmp_path, isolated_client):
+        responses.add(
+            responses.POST, f"{BASE_URL}/list/get",
+            json={"code": 0, "data": {
+                "documents": [{"id": "trash1", "name": "x"},
+                              {"id": "ok1", "name": "y"}],
+                "folders": [],
+            }}, status=200,
+            match=[matchers.json_params_matcher({"folderId": "0"})],
+        )
+        # 预写回收站：trash1 为软删除项
+        trash = tmp_path / "trash.json"
+        trash.write_text(json.dumps({"trash1": {
+            "id": "trash1", "type": "doc", "name": "x", "parent_id": "0",
+            "deleted_at": "2026-01-01T00:00:00",
+        }}))
+        monkeypatch.setattr(mubu.client, "TRASH_FILE", trash)
+        # 默认过滤软删除项
+        data = isolated_client.get_list("0")
+        ids = {d.get("id") for d in (data.get("documents") or [])}
+        assert "trash1" not in ids
+        assert "ok1" in ids
+        # include_trashed=True 时保留
+        data2 = isolated_client.get_list("0", include_trashed=True)
+        ids2 = {d.get("id") for d in (data2.get("documents") or [])}
+        assert "trash1" in ids2
+        assert "ok1" in ids2
+
+    @responses.activate
+    def test_search_filters_trashed(self, monkeypatch, tmp_path, isolated_client):
+        responses.add(
+            responses.POST, f"{BASE_URL}/list/get",
+            json={"code": 0, "data": {
+                "folders": [{"id": "trash1", "name": "x"}],
+                "documents": [{"id": "ok1", "name": "x"}],
+            }}, status=200,
+            match=[matchers.json_params_matcher({"folderId": "0"})],
+        )
+        trash = tmp_path / "trash.json"
+        trash.write_text(json.dumps({"trash1": {
+            "id": "trash1", "type": "folder", "name": "x", "parent_id": "0",
+            "deleted_at": "2026-01-01T00:00:00",
+        }}))
+        monkeypatch.setattr(mubu.client, "TRASH_FILE", trash)
+        # 默认：软删除项被过滤
+        res = isolated_client.search("x")
+        ids = {r["id"] for r in res["results"]}
+        assert "trash1" not in ids
+        assert "ok1" in ids
+        # include_trashed=True：软删除项也纳入
+        res2 = isolated_client.search("x", include_trashed=True)
+        ids2 = {r["id"] for r in res2["results"]}
+        assert "trash1" in ids2
+        assert "ok1" in ids2
 
 
 # --------------------------------------------------------------------------- #
@@ -1271,8 +1391,10 @@ class TestRequirementsSplit:
         text = dev.read_text(encoding="utf-8")
         assert "pytest" in text
         assert "responses" in text
-        # responses 应带上限，避免意外大版本跃迁
-        assert "<1" in text
+        # v1.3.5：改为 pip-compile 全量锁定（精确版本 + 哈希），不再使用上限约束
+        assert "--hash" in text        # 供应链加固：哈希锁定
+        assert "pytest==" in text      # 精确锁定版本
+        assert "responses==" in text
 
     def test_runtime_requirements_has_only_requests(self):
         rt = REPO_ROOT / "requirements.txt"

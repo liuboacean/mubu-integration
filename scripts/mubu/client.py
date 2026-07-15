@@ -16,6 +16,7 @@ from mubu.config import (
     ENDPOINTS,
     ENV_FILE,
     TOKEN_FILE,
+    TRASH_FILE,
     REQUEST_TIMEOUT,
     MAX_NETWORK_RETRIES,
     NETWORK_BACKOFF,
@@ -306,9 +307,29 @@ class MubuClient:
         if not self.token:
             self.login()
 
-    def get_list(self, folder_id: str = "0") -> List[Dict]:
-        """获取文件夹下的文档和子文件夹列表"""
+    def get_list(self, folder_id: str = "0",
+                 include_trashed: bool = False) -> List[Dict]:
+        """获取文件夹下的文档和子文件夹列表。
+
+        Args:
+            folder_id: 文件夹 ID（默认 "0" 为根）
+            include_trashed: 为 False 时过滤掉已软删除（回收站）中的项；
+                为 True 时保留。软删除不影响云端，仅本地标记过滤。
+        """
         data = self._request(*ENDPOINTS["list"], json={"folderId": folder_id})
+        if not include_trashed:
+            trash = self._load_trash()
+            if trash:
+                # 文件夹：直接过滤
+                folders = data.get("folders", []) or []
+                data["folders"] = [f for f in folders if f.get("id") not in trash]
+                # 文档：保留接口实际返回的 key（真机返回 documents，旧兜底 docs）
+                if "documents" in data:
+                    docs = data.get("documents") or []
+                    data["documents"] = [d for d in docs if d.get("id") not in trash]
+                elif "docs" in data:
+                    docs = data.get("docs") or []
+                    data["docs"] = [d for d in docs if d.get("id") not in trash]
         return data
 
     def create_folder(self, name: str, parent_id: str = "0") -> str:
@@ -385,6 +406,77 @@ class MubuClient:
             self.delete_doc(item_id)
         else:
             self.delete_folder(item_id)
+
+    # --------------------------------------------------------------------- #
+    # 软删除 / 本地回收站（v1.3.5）
+    # 设计：delete = 软删除（仅本地标记，云端仍在）；restore = 移除标记；
+    # purge = 唯一不可逆操作，调用真实删除 API 后移除标记。
+    # 回收站仅存元数据快照作为安全网，不作为重建来源。
+    # --------------------------------------------------------------------- #
+    def _load_trash(self) -> Dict[str, Any]:
+        """读取本地回收站快照；文件缺失或损坏返回 {}。"""
+        if TRASH_FILE.exists():
+            try:
+                return json.loads(TRASH_FILE.read_text(encoding="utf-8")) or {}
+            except Exception:
+                return {}
+        return {}
+
+    def _save_trash(self, trash: Dict) -> None:
+        """原子写回收站快照：tmp → rename → chmod 600，整体置于文件锁内。"""
+        with _token_file_lock():
+            tmp = TRASH_FILE.parent / (TRASH_FILE.name + ".tmp")
+            tmp.write_text(json.dumps(trash, ensure_ascii=False, indent=2),
+                           encoding="utf-8")
+            os.rename(tmp, TRASH_FILE)
+            os.chmod(TRASH_FILE, TOKEN_FILE_MODE)
+
+    def trash_item(self, item_id: str, item_type: str,
+                   name: str = "", parent_id: str = "0") -> None:
+        """软删除：把项标记进本地回收站，零服务端调用（云端仍在）。"""
+        trash = self._load_trash()
+        trash[item_id] = {
+            "id": item_id,
+            "type": item_type,
+            "name": name,
+            "parent_id": parent_id,
+            "deleted_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        }
+        self._save_trash(trash)
+
+    def restore_item(self, item_id: str) -> bool:
+        """恢复：仅移除本地标记，零服务端调用。成功返回 True，未找到返回 False。"""
+        trash = self._load_trash()
+        if item_id in trash:
+            trash.pop(item_id)
+            self._save_trash(trash)
+            return True
+        return False
+
+    def purge_item(self, item_id: str) -> None:
+        """彻底删除：唯一不可逆操作。
+
+        先从回收站读出类型，调用真实删除 API（delete_doc / delete_folder），
+        成功后移除本地标记。调用方须已通过 CLI --yes 守卫确认。
+        """
+        trash = self._load_trash()
+        item = trash.get(item_id)
+        item_type = item.get("type") if item else "folder"
+        if item_type == "doc":
+            self.delete_doc(item_id)
+        else:
+            self.delete_folder(item_id)
+        if item_id in trash:
+            trash.pop(item_id)
+            self._save_trash(trash)
+
+    def list_trash(self) -> List[Dict]:
+        """列出回收站中所有已软删除的项（元数据快照）。"""
+        return list(self._load_trash().values())
+
+    def is_trashed(self, item_id: str) -> bool:
+        """判断项是否已在本地回收站中。"""
+        return item_id in self._load_trash()
 
     def move(self, item_id: str, target_folder_id: str) -> None:
         """移动文档到其他文件夹"""
@@ -469,7 +561,8 @@ class MubuClient:
     def search(self, keyword: str, root_folder_id: str = "0",
                max_depth: int = MAX_SEARCH_DEPTH,
                limit: int = MAX_SEARCH_LIMIT,
-               max_requests: int = MAX_SEARCH_REQUESTS) -> Dict[str, Any]:
+               max_requests: int = MAX_SEARCH_REQUESTS,
+               include_trashed: bool = False) -> Dict[str, Any]:
         """本地递归搜索：名称包含关键字的文档与文件夹（T6，M4 T2 增强）。
 
         mubu 无公开 /search 端点，从根文件夹开始递归遍历所有子文件夹，
@@ -502,6 +595,8 @@ class MubuClient:
         req_count = 0
         truncated = False
         visited: set = set()  # 已访问 folder_id，防环引用无限递归
+        # 软删除过滤集：含 include_trashed 时不加载（即不过滤）
+        trash = self._load_trash() if not include_trashed else {}
 
         def walk(folder_id: str, path: str, depth: int) -> None:
             nonlocal req_count, truncated
@@ -513,7 +608,7 @@ class MubuClient:
                     truncated = True
                 return
             try:
-                data = self.get_list(folder_id)
+                data = self.get_list(folder_id, include_trashed=include_trashed)
             except MubuError as e:
                 # 单个文件夹拉取失败不阻断整体遍历
                 logger.warning("遍历文件夹 %s 失败: %s", folder_id, e)
@@ -525,21 +620,29 @@ class MubuClient:
             folders = data.get("folders", []) or []
             docs = data.get("documents") or data.get("docs") or []
             for d in docs:
+                doc_id = d.get("id")
+                # 软删除项：除非显式 include_trashed，否则跳过
+                if not include_trashed and doc_id in trash:
+                    continue
                 name = d.get("name") or ""
                 if keyword_lower and keyword_lower in name.lower():
-                    results.append({"id": d.get("id"), "name": name, "type": "doc", "path": path})
+                    results.append({"id": doc_id, "name": name, "type": "doc", "path": path})
                     if len(results) >= limit:
                         truncated = True
                         return
             for f in folders:
+                fid = f.get("id")
+                # 软删除项：除非显式 include_trashed，否则跳过
+                if not include_trashed and fid in trash:
+                    continue
                 name = f.get("name") or ""
                 if keyword_lower and keyword_lower in name.lower():
-                    results.append({"id": f.get("id"), "name": name, "type": "folder", "path": path})
+                    results.append({"id": fid, "name": name, "type": "folder", "path": path})
                     if len(results) >= limit:
                         truncated = True
                         return
                 child_path = f"{path}/{name}" if path else name
-                walk(f.get("id"), child_path, depth + 1)
+                walk(fid, child_path, depth + 1)
 
         walk(root_folder_id, "", 0)
         return {

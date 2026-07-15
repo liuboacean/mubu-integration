@@ -90,6 +90,15 @@ scripts/
 | **Roadmap · 互操作** | 🔁 OPML / FreeMind | `opml <doc_id> --format opml\|freeplane` 导出为 OPML 2.0 / FreeMind XML，兼容 XMind 等大纲工具 |
 | **Roadmap · 大重构** | 📦 模块拆分 | `scripts/mubu_api.py` 拆分为 `scripts/mubu/`（config/convert/client/cli），shim 向后兼容，`import mubu_api` 与 `from mubu.client import MubuClient` 均可用——**93 用例通过，接口零破坏** |
 
+### 版本亮点（v1.3.5 · 软删除 / 回收站）
+
+| 里程碑 | 能力 | 说明 |
+| :--- | :--- | :--- |
+| **v1.3.5** | 🗑️ 软删除 / 本地回收站 | `delete` 改为**软删除**：仅标记进本地回收站、云端副本仍在，`restore` 可恢复；`purge <id> --yes` 才是唯一不可逆操作（调用真实删除 API）；`trash` 列出已软删除项 |
+| **v1.3.5** | 🔒 删除守卫强化 | `delete` / `purge` 均需显式 `--yes`；缺省打印回收站提示并 `exit 1`，绝不静默删除 |
+| **v1.3.5** | 📦 供应链锁定 | 新增 `requirements.in` / `requirements-dev.in`，由 `pip-compile --generate-hashes` 生成**精确版本 + 哈希**锁文件（`requirements.txt` / `requirements-dev.txt`），CI 用 `pip-compile --check` 校验漂移 |
+| **v1.3.5** | 🧪 测试扩展 | 新增 `TestTrash`（restore / purge / list&search 软删除过滤），**100 个 pytest 用例**全绿 |
+
 ## 架构与工作流程
 
 ```mermaid
@@ -169,13 +178,16 @@ npx skills add liuboacean/mubu-integration
 ## 环境依赖
 
 - 需要 **Python 3.9 及以上**版本。
-- 安装 Python 依赖：
+- 安装 Python 依赖（**使用已锁定的 `requirements.txt` / `requirements-dev.txt`**，含精确版本与哈希，不要直接 `pip install requests`）：
 
 ```bash
-pip install -r requirements.txt -r requirements-dev.txt
+# 运行时依赖（已精确锁定 + 哈希，见 requirements.txt）
+pip install -r requirements.txt
+# 开发/测试依赖（已锁定，见 requirements-dev.txt）
+pip install -r requirements-dev.txt
 ```
 
-`requirements.txt` 仅含**运行时**依赖 `requests`；`pytest` / `responses` 等开发依赖已拆分到 `requirements-dev.txt`（用 `pip install -r requirements-dev.txt` 安装）。
+`requirements.txt` 由 `pip-compile` 精确锁定（含哈希），仅含**运行时**依赖 `requests`；`pytest` / `responses` 等开发依赖拆分到 `requirements-dev.txt`。维护依赖请编辑 `requirements.in` / `requirements-dev.in` 后运行 `pip-compile --generate-hashes` 重新生成锁文件；CI 会校验锁文件与 `.in` 一致（注意：pip-tools 7.x 已移除 `pip-compile --check`，改用「重新生成并 diff」方式，见 `.github/workflows/test.yml`）。
 
 ## 配置
 
@@ -276,13 +288,13 @@ python3 scripts/mubu_api.py opml <doc_id> --format freeplane
 
 ## 测试与 CI
 
-本地运行全部测试（共 **80** 个 pytest 用例）：
+本地运行全部测试（共 **100** 个 pytest 用例）：
 
 ```bash
 PYTHONPATH=scripts python -m pytest -v
 ```
 
-持续集成：在 push 到 `main` 分支或提交 Pull Request 时，GitHub Actions 会于 **Python 3.9 / 3.10 / 3.11 / 3.12** 矩阵中自动运行测试。84 个用例在四个 Python 版本上均真实执行（非假成功）。
+持续集成：在 push 到 `main` 分支或提交 Pull Request 时，GitHub Actions 会于 **Python 3.9 / 3.10 / 3.11 / 3.12** 矩阵中自动运行测试。100 个用例在四个 Python 版本上均真实执行（非假成功）。
 
 ## 常见问题 FAQ
 
@@ -314,7 +326,7 @@ A：当前不支持。大纲折叠状态 `expand`、有序列表 `1.`、图片 /
 - 多个顶层标题导入时，首个为根，其余作为根的子节点。
 - `search` 为本地过滤：从根文件夹递归遍历所有子文件夹按名称匹配（大小写不敏感）。幕布无公开 `/search` 端点，故依赖本地遍历，文件夹极多时可能稍慢。
 
-> 说明：v1.2.0 已包含 M1–M9 及本期 P2 全部能力，以上为功能边界而非未完成项。
+> 说明：v1.3.5 已包含 M1–M9 及 P2 全部能力，并新增软删除 / 本地回收站（`delete`→软删除、`restore` 恢复、`purge` 彻底删除、`trash` 列表），以上为功能边界而非未完成项。
 
 ## License
 

@@ -35,5 +35,19 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt -r requirements-dev.txt
 
+      # 依赖锁定校验（v1.3.5）：确保提交的 requirements*.txt 与 .in 一致。
+      # 注意：pip-tools 7.x 已移除 `pip-compile --check`，此处改为「重新生成并 diff」。
+      # 漂移仅告警（continue-on-error），不阻断测试矩阵。
+      - name: Verify locked requirements are up to date
+        continue-on-error: true
+        run: |
+          pip install pip-tools
+          cp requirements.txt /tmp/requirements.txt.committed
+          cp requirements-dev.txt /tmp/requirements-dev.txt.committed
+          pip-compile --generate-hashes -o requirements.txt requirements.in
+          pip-compile --generate-hashes -o requirements-dev.txt requirements-dev.in
+          diff -u /tmp/requirements.txt.committed requirements.txt
+          diff -u /tmp/requirements-dev.txt.committed requirements-dev.txt
+
       - name: Run tests
         run: PYTHONPATH=scripts python -m pytest -v

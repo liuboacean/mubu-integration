@@ -60,6 +60,12 @@ def _resolve_base_url() -> str:
 BASE_URL = _resolve_base_url()
 TOKEN_FILE = Path.home() / ".mubu_token"
 
+# 本地回收站（软删除）快照文件：仅记录元数据（id / type / name / parent_id /
+# deleted_at），作为「云端仍在、可恢复」的安全网；永不作为重建来源。
+# 软删除（delete）→ 仅写入此文件、零服务端调用；restore → 仅移除标记；
+# purge → 调用真实删除 API 后移除标记（唯一不可逆操作）。
+TRASH_FILE = Path.home() / ".workbuddy" / ".mubu_trash.json"
+
 # .env 凭据文件路径：仅当环境变量未设置时用于补全 MUBU_PHONE / MUBU_PASSWORD
 ENV_FILE = Path.home() / ".workbuddy" / ".env.mubu"
 
