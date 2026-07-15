@@ -198,6 +198,24 @@
 
 - 依赖/破坏性：无破坏性变更（`delete` 语义由「永久删除」变为「本地软删除」，保留 `--yes` 守卫；`purge --yes` 为唯一不可逆操作）
 
+## M16 (安全姿态补丁) — client.delete 对齐软删除 + 文档修正（2026-07-15）
+
+ClawHub SkillSpector 复审（GO；1 项 High 降为 Medium）3 项真实发现的修复：
+
+- fix: `client.delete()` 现路由到 `trash_item`（本地软删除，零网络），与 v1.3.5 CLI 语义及 `client.py` 设计注释（"delete = 软删除（仅本地标记，云端仍在）"）一致；真实硬删仅保留 `purge_item` / `delete_doc` / `delete_folder`（由 `purge --yes` 调用）。此前 `client.delete()` 实际走 `delete_folder`/`delete_doc` 远程硬删，与注释及 CLI 语义矛盾，程序化调用方会触发不可逆云端删除。
+- docs: README `delete` 命令描述由「不可逆」修正为「软删除（本地回收站）」；`purge --yes` 才是不可逆。同步修正 P2 里程碑表对 `delete` 的「不可逆」表述。
+- test: 100 passed（无回归）。`client.delete()` 现不触发任何网络调用，既有 `delete --yes` 守卫 / 回收站写入 / `purge` 行为测试全部保持。
+- 依赖/破坏性：无破坏性变更（`delete()` 由「远程硬删」收敛为「本地软删」，与文档语义一致）。
+
+## v1.3.6（本期发布版本 · 2026-07-15）
+
+本期为 SkillSpector 复审安全姿态补丁（GitHub tag v1.3.6）。详见上方 M16。
+
+- fix: `client.delete()` 对齐 v1.3.5 CLI 软删除语义（本地标记、零网络）；真实硬删仅 `purge --yes`。
+- docs: README L261 `delete` 由「不可逆」改为「软删除（本地回收站）」；Roadmap 软删除 / 依赖锁文件项标记为已在 M15/v1.3.5 完成。
+- test: 100 passed（无回归）。
+- 依赖/破坏性：无破坏性变更。
+
 ## Roadmap（向前展望，尚未实现）
 
 以下为已识别、尚未排入实施的能力增强与重构方向，供后续迭代参考：
@@ -205,7 +223,7 @@
 - **模块拆分（排障手 #18）**：✅ 已在 M11 完成——`scripts/mubu_api.py` 拆分为 `scripts/mubu/`（config / convert / client / cli），`mubu_api.py` 保留为向后兼容 shim，93 用例通过。
 - **文件夹重命名 / 移动增强（产品官 #14）**：补全 `rename_folder` 等高层方法，提升目录管理能力。
 - **整树递归导出（产品官 #14）**：支持将整个文件夹树递归导出为单一 Markdown / JSON，便于整体备份。
-- **软删除 / 回收站（产品官 #14 P2）**：当前 `delete` 为永久删除（已加 `--yes` 守卫与不可逆警示）；若幕布开放回收站接口，可增加软删除通道。
+- **软删除 / 回收站（产品官 #14 P2）**：✅ 已在 M15/v1.3.5 完成——`delete` 改为本地软删除（仅标记进 `~/.workbuddy/.mubu_trash.json`，零网络），`restore` 恢复、`purge <id> --yes` 真实硬删、`trash` 列出；`list`/`search` 默认过滤已软删项。
 - **互操作导出（产品官 #25）**：导出支持 OPML / FreeMind 格式，便于导入到其他大纲工具。
-- **依赖锁文件（排障手 #21）**：引入 `pip-tools` 生成 `requirements.lock.txt`，配合 `--require-hashes` 进一步提升供应链可复现性。
+- **依赖锁文件（排障手 #21）**：✅ 已在 M15/v1.3.5 完成——引入 `pip-tools`，`requirements.in`/`requirements-dev.in` 由 `pip-compile --generate-hashes` 生成精确版本 + 哈希锁文件，CI 校验漂移。
 

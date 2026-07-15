@@ -398,14 +398,13 @@ class MubuClient:
         self._request(*ENDPOINTS["delete_doc"], json={"id": doc_id})
 
     def delete(self, item_id: str, item_type: str = "folder") -> None:
-        """删除文档或文件夹（按类型分发，默认 folder）。
+        """本地软删除（v1.3.6 对齐 CLI 语义）：仅将项标记入本地回收站，零网络调用。
 
-        兼容旧调用；新代码建议直接用 delete_folder / delete_doc。
+        与 v1.3.5 CLI `delete` 子命令及下方设计注释一致——仅本地标记，
+        云端副本仍在。真实硬删仅保留给 `purge_item`（由 CLI `purge --yes`
+        触发）。兼容旧调用；新代码建议直接用 `trash_item` / `purge_item`。
         """
-        if item_type == "doc":
-            self.delete_doc(item_id)
-        else:
-            self.delete_folder(item_id)
+        self.trash_item(item_id, item_type)
 
     # --------------------------------------------------------------------- #
     # 软删除 / 本地回收站（v1.3.5）

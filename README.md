@@ -79,7 +79,7 @@ scripts/
 | **M3 · P2** | 🧪 工程化 | 全量类型注解、`requirements.txt`、CI 自动化测试（84 用例 × 4 Python 版本） |
 | **M8 · 安全** | 🔐 凭据与路径安全 | `.env.mubu` 强制 `0o600`、移除明文参数改交互式 `getpass`、本地路径越界防护 `_safe_local_path`、API 域名白名单防 MITM |
 | **M9 · P1** | 🔍 搜索截断 + 可观测 | `search()` 返回 `truncated` 标记与防环去重；标准 `logging`+敏感脱敏+`--verbose`；401/403/5xx/网络错误 stderr 指引；CI 钉死 action SHA + Dependabot |
-| **P2 · 工程化** | ⚡ 性能与供应链 | `requests.Session` 连接复用（搜索多请求提速）、依赖拆分 `requirements.txt`+`requirements-dev.txt`、删除操作不可逆警示 |
+| **P2 · 工程化** | ⚡ 性能与供应链 | `requests.Session` 连接复用（搜索多请求提速）、依赖拆分 `requirements.txt`+`requirements-dev.txt`、删除守卫（`--yes` 确认 + 回收站软删除） |
 
 ### 版本亮点（v1.3.0 · Roadmap）
 
@@ -258,7 +258,7 @@ python3 scripts/mubu_api.py save <doc_id> --md outline.md
 # 移动文档到其他文件夹
 python3 scripts/mubu_api.py move <doc_id> --target <folder_id>
 
-# 删除（⚠️ 不可逆，执行前务必确认目标 ID；必须显式 --yes；--type 默认 folder）
+# 删除（软删除 → 本地回收站；执行前仍须确认目标 ID；必须显式 --yes；--type 默认 folder）
 python3 scripts/mubu_api.py delete <id> --type folder --yes
 python3 scripts/mubu_api.py delete <doc_id> --type doc --yes
 
