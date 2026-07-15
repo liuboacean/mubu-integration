@@ -172,6 +172,17 @@
 - docs: SKILL.md 校正 get_doc 端点、`Jwt-Token` 请求头、移除不存在的 `refresh_token 30天` 描述
 - 依赖/破坏性：无破坏性变更
 
+## v1.3.4（本期发布版本 · 2026-07-15）
+
+本期为 OPML/FreeMind 导出兼容真实 nodes 形状修复 + save_doc 客户端契约校验（GitHub tag v1.3.4）。
+
+- fix: `doc_to_opml` / `doc_to_freeplane` 支持真实 `nodes` 形状（双形状兼容旧 `node`）；OPML/FreeMind 导出不再产出空大纲
+- fix: `cli` 的 `create` / `save` 回写 content 使用 `{"nodes":[node]}` definition 字符串，与 `get_doc` 同构
+- verify: `save_doc` 真机 round-trip 被幕布服务端签名/反爬校验拒绝（`illegal request`, code 17），与请求体形状无关；客户端契约（content = definition JSON 字符串 `json.dumps({"nodes":[...]}, ensure_ascii=False)`）正确，**无需改代码**，docstring 已标注此已知限制
+- test: 96 passed（修正 1 个过时 rename 夹具 + 新增 OPML/FreeMind nodes 形状测试）
+- 已知限制: `save_doc` / `rename_doc` 真机写回需服务端对该客户端放行（反爬签名），目前端到端落库不可达
+- 依赖/破坏性：无破坏性变更
+
 ## Roadmap（向前展望，尚未实现）
 
 以下为已识别、尚未排入实施的能力增强与重构方向，供后续迭代参考：
