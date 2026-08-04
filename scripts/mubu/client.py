@@ -4,6 +4,7 @@ import os
 import json
 import time
 import logging
+import uuid
 from pathlib import Path
 from typing import Optional, Dict, List, Any, Iterator
 
@@ -48,6 +49,10 @@ class MubuClient:
         # P2 #22：复用 requests.Session 连接池，search 多请求场景下避免每次新建连接
         self._session = requests.Session()
         self._load_token()
+        # 排障手 move-sign 第 1 步：模拟浏览器 window.uniqueId / 会话的稳定标识，
+        # 整个客户端生命周期内不变，用于对齐网页端请求头以平抑 code:17（真机待验证）。
+        self._client_unique_id = str(uuid.uuid4())
+        self._session_id = str(uuid.uuid4())
 
     def _load_env_file(self, path: Optional[Path] = None) -> None:
         """从 .env 文件加载凭据（仅当环境变量未设置时补全）。
@@ -121,10 +126,24 @@ class MubuClient:
             os.chmod(TOKEN_FILE, TOKEN_FILE_MODE)
 
     def _get_headers(self) -> Dict[str, str]:
-        """获取带认证的请求头"""
+        """获取带认证的请求头。
+
+        在 DEFAULT_HEADERS 基础上补 4 个「浏览器同款」头，对齐网页版 mubu 前端
+        的请求出口（app.js 模块 15224 的 axios 封装）：data-unique-id /
+        x-session-id / x-reg-entrance / x-request-id。前三者为客户端生命周期内
+        稳定值（__init__ 中生成）；x-request-id 每次请求重新生成（uuid4）。
+        Jwt-Token 原有逻辑不变。
+
+        注：排障手 move-sign 第 1 步廉价验证。真机是否因此消除 code:17 待验证；
+        若仍失败则属端点/body 形态问题（见 move / save_doc docstring），回退抓包。
+        """
         headers = DEFAULT_HEADERS.copy()
         if self.token:
             headers["Jwt-Token"] = self.token
+        headers["data-unique-id"] = self._client_unique_id
+        headers["x-session-id"] = self._session_id
+        headers["x-reg-entrance"] = "https://mubu.com/"
+        headers["x-request-id"] = str(uuid.uuid4())
         return headers
 
     def ensure_valid_token(self) -> None:

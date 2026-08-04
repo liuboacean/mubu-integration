@@ -1619,4 +1619,68 @@ class TestSafeFilename:
 
 
 # --------------------------------------------------------------------------- #
+# 27. 排障手 move-sign 第 1 步 — 浏览器同款 x-头（离线验证，mock 网络）
+#     断言 _get_headers() 与一次被 mock 的请求都携带 4 个浏览器同款头，且
+#     Jwt-Token 在持有 token 时仍在、无 token 时缺省；x-request-id 每次请求不同，
+#     data-unique-id / x-session-id 在实例生命周期内稳定。
+# --------------------------------------------------------------------------- #
+class TestBrowserParityHeaders:
+    def _client_with_token(self, tmp_path):
+        tok = tmp_path / "tok.json"
+        with mock.patch.object(mubu.client, "TOKEN_FILE", tok):
+            c = MubuClient(phone="p", password="w")
+            c.token = "valid-token"
+            c.expires_at = time.time() + 3600
+            return c
+
+    def test_get_headers_has_four_browser_headers(self, tmp_path):
+        c = self._client_with_token(tmp_path)
+        h = c._get_headers()
+        assert h["data-unique-id"] == c._client_unique_id
+        assert h["x-session-id"] == c._session_id
+        assert h["x-reg-entrance"] == "https://mubu.com/"
+        # x-request-id 是合法 uuid4
+        import uuid as _uuid
+        assert _uuid.UUID(h["x-request-id"]).version == 4
+
+    def test_request_id_differs_per_call(self, tmp_path):
+        c = self._client_with_token(tmp_path)
+        assert c._get_headers()["x-request-id"] != c._get_headers()["x-request-id"]
+
+    def test_unique_id_and_session_stable_per_instance(self, tmp_path):
+        c = self._client_with_token(tmp_path)
+        h1, h2 = c._get_headers(), c._get_headers()
+        # 稳定值跨调用不变
+        assert h1["data-unique-id"] == h2["data-unique-id"] == c._client_unique_id
+        assert h1["x-session-id"] == h2["x-session-id"] == c._session_id
+        # 但 x-request-id 每次都应不同
+        assert h1["x-request-id"] != h2["x-request-id"]
+
+    def test_jwt_token_present_when_token_set(self, tmp_path):
+        c = self._client_with_token(tmp_path)
+        assert c._get_headers()["Jwt-Token"] == "valid-token"
+
+    def test_jwt_token_absent_when_no_token(self):
+        c = MubuClient(phone="p", password="w")
+        c.token = None
+        assert "Jwt-Token" not in c._get_headers()
+
+    @mock.patch("requests.Session.request")
+    def test_outgoing_request_carries_all_headers(self, mreq, tmp_path):
+        """端到端：一次被 mock 的真实请求，其出站头应含 4 个浏览器同款头 + Jwt-Token。"""
+        c = self._client_with_token(tmp_path)
+        resp = mock.Mock()
+        resp.status_code = 200
+        resp.json.return_value = {"code": 0, "data": {"folders": [], "docs": []}}
+        mreq.return_value = resp
+        c.get_list("0")
+        assert mreq.call_count == 1
+        sent_headers = mreq.call_args.kwargs.get("headers") or mreq.call_args.args[2]
+        for key in ("data-unique-id", "x-session-id", "x-reg-entrance", "x-request-id"):
+            assert key in sent_headers, f"缺失浏览器同款头: {key}"
+        assert sent_headers["x-reg-entrance"] == "https://mubu.com/"
+        assert sent_headers["Jwt-Token"] == "valid-token"
+
+
+# --------------------------------------------------------------------------- #
 
