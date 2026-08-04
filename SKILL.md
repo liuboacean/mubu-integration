@@ -55,13 +55,13 @@ export MUBU_PASSWORD="your_password"      # 幕布账号密码
 
 ### 1. 使用 MubuClient
 
-所有操作都通过 `scripts/mubu_api.py` 中的 `MubuClient` 类完成（**不再有**独立的
+所有操作都通过 `scripts/mubu/client.py` 中的 `MubuClient` 类完成（`scripts/mubu_api.py` 仅为向后兼容的重新导出 shim，不再建议直接使用；**不再有**独立的
 `login()` / `create_folder()` / `create_doc()` / `get_list()` / `get_doc()` / `save_doc()` /
 `delete_item()` 模块级函数）。实例化时自动读取 `MUBU_PHONE` / `MUBU_PASSWORD`
 环境变量（或 `~/.workbuddy/.env.mubu`）并加载本地缓存 Token：
 
 ```python
-from scripts.mubu_api import MubuClient
+from mubu.client import MubuClient
 
 # 登录：凭据来自环境变量；返回扁平 data（token / id / name）
 client = MubuClient()

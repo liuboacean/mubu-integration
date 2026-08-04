@@ -247,3 +247,19 @@ ClawHub SkillSpector 复审（GO；1 项 High 降为 Medium）3 项真实发现�
 - test: 新增 `test_purge_without_trash_requires_type` / `test_purge_explicit_type_doc`（锁定 purge 安全行为）
 - 依赖/破坏性：无破坏性变更（purge CLI 新增可选 `--type`，向后兼容；其余均为文档/配置）
 
+## M18 (v1.3.8) — SKILL.md 过期模块引用修正（2026-08-04，发布）
+
+本期为纯文档一致性修正，无业务代码改动（GitHub tag v1.3.8）。
+
+- **docs: SKILL.md 过期引用修正**：`scripts/mubu_api.py` 早在 M11 已重构为正式包 `scripts/mubu/`，`mubu_api.py` 降级为仅重新导出的向后兼容 shim。SKILL.md 第 58/64 行仍将 `MubuClient` 描述为位于 `scripts/mubu_api.py` 并以 `from scripts.mubu_api import MubuClient` 引入，与真实代码及 `cli.py` 不一致。修正为：类位于 `scripts/mubu/client.py`，import 路径 `from mubu.client import MubuClient`；并注明 `mubu_api.py` 仅为重新导出 shim，不再建议直接使用。
+- **一致性核对**：`cli.py` 与 `client.py` 的 import 路径本就为 `mubu.client`，本次仅让文档与其对齐，无导入逻辑变化。
+- 依赖/破坏性：无业务代码改动，纯文档一致性；测试 **102 passed（0 失败，无回归）**。
+
+## v1.3.8（本期发布版本 · 2026-08-04）
+
+本期为 SKILL.md 过期模块引用修正（GitHub tag v1.3.8）。详见上方 M18。
+
+- docs: SKILL.md 将 `MubuClient` 位置由 `scripts/mubu_api.py` 修正为 `scripts/mubu/client.py`，import 语句由 `from scripts.mubu_api import MubuClient` 修正为 `from mubu.client import MubuClient`，与 `cli.py` 一致；标注 `mubu_api.py` 仅为向后兼容 shim
+- test: 102 passed（0 失败，无用例增减，纯文档修正）
+- 依赖/破坏性：无业务代码改动，纯文档一致性
+
