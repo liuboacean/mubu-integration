@@ -423,7 +423,9 @@ class TestSaveTokenAtomic:
 
     def test_uses_os_rename(self, tmp_path):
         tok = tmp_path / "tok.json"
-        with mock.patch.object(mubu.client, "TOKEN_FILE", tok):
+        # 隔离 ENV_FILE，避免读取用户真实 ~/.workbuddy/.env.mubu（其 chmod 会污染 os.chmod mock）
+        with mock.patch.object(mubu.client, "ENV_FILE", tmp_path / "no_env.mubu"), \
+                mock.patch.object(mubu.client, "TOKEN_FILE", tok):
             with mock.patch("os.rename") as mren, \
                     mock.patch("os.chmod") as mchmod:
                 c = MubuClient(phone="p", password="w")
@@ -464,7 +466,14 @@ class TestCliParsing:
     def test_cli_move_parses(self, monkeypatch):
         err, MC, _ = self._run(["move", "item1", "--target", "fid"], monkeypatch)
         assert err is None
-        MC.return_value.move.assert_called_once_with("item1", "fid")
+        MC.return_value.move.assert_called_once_with("item1", "fid", "doc")
+
+    def test_cli_move_folder_type_parses(self, monkeypatch):
+        # --type folder 应透传给 client.move 的 item_type 参数
+        err, MC, _ = self._run(
+            ["move", "fld1", "--target", "fid", "--type", "folder"], monkeypatch)
+        assert err is None
+        MC.return_value.move.assert_called_once_with("fld1", "fid", "folder")
 
     def test_cli_get_export_markdown_parses(self, monkeypatch):
         err, MC, _ = self._run(["get", "doc123", "--export", "markdown"], monkeypatch)
@@ -920,11 +929,13 @@ class TestApiMethodPayloads:
 
         def cb(request):
             captured["body"] = json.loads(request.body)
+            captured["path"] = request.path_url
             return (200, {}, json.dumps({"code": 0, "data": {}}))
 
-        responses.add_callback(responses.POST, f"{BASE_URL}/list/move", callback=cb)
-        isolated_client.move("D9", "F2")
-        assert captured["body"] == {"id": "D9", "folderId": "F2"}
+        responses.add_callback(responses.POST, f"{BASE_URL}/list/custom/drag", callback=cb)
+        isolated_client.move("D9", "F2", item_type="doc")
+        assert captured["body"] == {"dst": None, "src": [{"type": "doc", "id": "D9"}], "folderId": "F2"}
+        assert "/list/custom/drag" in captured["path"]
 
 
 # --------------------------------------------------------------------------- #
@@ -1143,6 +1154,9 @@ class TestLoginCliNoPlaintextArgs:
     def test_login_prompts_getpass_when_env_missing(self, monkeypatch, tmp_path, capsys):
         monkeypatch.delenv("MUBU_PHONE", raising=False)
         monkeypatch.delenv("MUBU_PASSWORD", raising=False)
+        # 隔离 ENV_FILE，避免读取用户真实 ~/.workbuddy/.env.mubu 把 MUBU_PHONE/
+        # MUBU_PASSWORD 重新写回环境，覆盖本测试的 getpass 模拟输入
+        monkeypatch.setattr(mubu.client, "ENV_FILE", tmp_path / "no_env.mubu")
         responses.add(responses.POST, f"{BASE_URL}/user/phone_login",
                       json={"code": 0, "data": {"token": "T1", "id": "U1", "name": "alice"}},
                       status=200)
@@ -1637,8 +1651,10 @@ class TestBrowserParityHeaders:
         c = self._client_with_token(tmp_path)
         h = c._get_headers()
         assert h["data-unique-id"] == c._client_unique_id
-        assert h["x-session-id"] == c._session_id
-        assert h["x-reg-entrance"] == "https://mubu.com/"
+        # x-session-id 形如 {uuid}:{epoch秒}，前缀稳定
+        assert h["x-session-id"].split(":", 1)[0] == c._session_id
+        assert h["x-session-id"].split(":", 1)[1].isdigit()
+        assert h["x-reg-entrance"] == "https://mubu.com/app"
         # x-request-id 是合法 uuid4
         import uuid as _uuid
         assert _uuid.UUID(h["x-request-id"]).version == 4
@@ -1650,9 +1666,13 @@ class TestBrowserParityHeaders:
     def test_unique_id_and_session_stable_per_instance(self, tmp_path):
         c = self._client_with_token(tmp_path)
         h1, h2 = c._get_headers(), c._get_headers()
-        # 稳定值跨调用不变
+        # data-unique-id 跨调用不变
         assert h1["data-unique-id"] == h2["data-unique-id"] == c._client_unique_id
-        assert h1["x-session-id"] == h2["x-session-id"] == c._session_id
+        # x-session-id 前缀（uuid）稳定，整体形如 uuid:数字
+        assert h1["x-session-id"].split(":", 1)[0] == c._session_id
+        assert h2["x-session-id"].split(":", 1)[0] == c._session_id
+        assert h1["x-session-id"].split(":", 1)[1].isdigit()
+        assert h2["x-session-id"].split(":", 1)[1].isdigit()
         # 但 x-request-id 每次都应不同
         assert h1["x-request-id"] != h2["x-request-id"]
 
@@ -1678,7 +1698,7 @@ class TestBrowserParityHeaders:
         sent_headers = mreq.call_args.kwargs.get("headers") or mreq.call_args.args[2]
         for key in ("data-unique-id", "x-session-id", "x-reg-entrance", "x-request-id"):
             assert key in sent_headers, f"缺失浏览器同款头: {key}"
-        assert sent_headers["x-reg-entrance"] == "https://mubu.com/"
+        assert sent_headers["x-reg-entrance"] == "https://mubu.com/app"
         assert sent_headers["Jwt-Token"] == "valid-token"
 
 

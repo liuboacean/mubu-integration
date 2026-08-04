@@ -117,9 +117,11 @@ def main() -> None:
     )
 
     # 移动
-    move_parser = subparsers.add_parser("move", help="移动文档到其他文件夹")
-    move_parser.add_argument("item_id", help="文档ID")
+    move_parser = subparsers.add_parser("move", help="移动文档/文件夹到其他文件夹")
+    move_parser.add_argument("item_id", help="文档/文件夹 ID")
     move_parser.add_argument("--target", required=True, help="目标文件夹ID")
+    move_parser.add_argument("--type", default="doc", choices=["doc", "folder"],
+                             help="移动项类型（默认 doc）")
 
     # 搜索（T6，M4 T2 增加 --max-depth / --limit）
     search_parser = subparsers.add_parser("search", help="本地搜索文档/文件夹（按名称）")
@@ -277,7 +279,7 @@ def main() -> None:
                           f"{it.get('name')} / {it.get('deleted_at')}")
 
         elif args.command == "move":
-            client.move(args.item_id, args.target)
+            client.move(args.item_id, args.target, args.type)
             print(f"移动成功: {args.item_id} -> {args.target}")
 
         elif args.command == "search":

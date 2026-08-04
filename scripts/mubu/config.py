@@ -90,8 +90,9 @@ ENDPOINTS = {
     # 原推测的 /list/delete 实测返回 code 17 illegal request。
     "delete_folder": ("POST", "/list/delete_folder"),
     "delete_doc": ("POST", "/list/delete_doc"),
-    # move 端点尚未经真机验证（返回 illegal request），保留原推测值，待抓包确认
-    "move": ("POST", "/list/move"),
+    # move 端点已抓包确认（2026-08-04）：真实为 /list/custom/drag，旧推测的
+    # /list/move 实测返回 code 17 illegal request。body 见 client.move()。
+    "move": ("POST", "/list/custom/drag"),
 }
 
 # 网络重试配置（T5）

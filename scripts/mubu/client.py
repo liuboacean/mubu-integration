@@ -129,20 +129,20 @@ class MubuClient:
         """获取带认证的请求头。
 
         在 DEFAULT_HEADERS 基础上补 4 个「浏览器同款」头，对齐网页版 mubu 前端
-        的请求出口（app.js 模块 15224 的 axios 封装）：data-unique-id /
-        x-session-id / x-reg-entrance / x-request-id。前三者为客户端生命周期内
-        稳定值（__init__ 中生成）；x-request-id 每次请求重新生成（uuid4）。
+        的请求出口（app.js 模块 15224 的 axios 封装，并经 2026-08-04 抓包复核）：
+        data-unique-id / x-session-id / x-reg-entrance / x-request-id。
+        - data-unique-id：客户端生命周期内稳定 uuid4（__init__ 生成）。
+        - x-session-id：``{uuid}:{epoch秒}`` 格式（前缀稳定，后缀每次请求刷新）。
+        - x-reg-entrance：固定 ``https://mubu.com/app``。
+        - x-request-id：每次请求重新生成 uuid4。
         Jwt-Token 原有逻辑不变。
-
-        注：排障手 move-sign 第 1 步廉价验证。真机是否因此消除 code:17 待验证；
-        若仍失败则属端点/body 形态问题（见 move / save_doc docstring），回退抓包。
         """
         headers = DEFAULT_HEADERS.copy()
         if self.token:
             headers["Jwt-Token"] = self.token
         headers["data-unique-id"] = self._client_unique_id
-        headers["x-session-id"] = self._session_id
-        headers["x-reg-entrance"] = "https://mubu.com/"
+        headers["x-session-id"] = f"{self._session_id}:{int(time.time())}"
+        headers["x-reg-entrance"] = "https://mubu.com/app"
         headers["x-request-id"] = str(uuid.uuid4())
         return headers
 
@@ -505,18 +505,22 @@ class MubuClient:
         """判断项是否已在本地回收站中。"""
         return item_id in self._load_trash()
 
-    def move(self, item_id: str, target_folder_id: str) -> None:
-        """移动文档到其他文件夹。
+    def move(self, item_id: str, target_folder_id: str, item_type: str = "doc") -> None:
+        """移动文档/文件夹到其他文件夹。
 
-        ⚠️ 真机不可用（待抓包）：``/list/move`` 及 ``/list/move_folder`` /
-        ``/list/move_doc`` 等多种变体（不同字段名 folderId/toFolderId/parentId/
-        targetId）在真机均返回 ``code:17 / illegal request``，真实端点未知
-        （M12/M13 实测）。当前保留实现仅供结构完整，**不要在生产依赖**；待浏览器
-        DevTools 抓包确认正确端点后再修。
+        真实端点已抓包确认（2026-08-04）：``POST /list/custom/drag``（旧推测的
+        ``/list/move`` 真机返回 ``code:17 / illegal request``）。请求体形状：
+        ``{"dst": null, "src": [{"type": "doc"|"folder", "id": ...}],
+        "folderId": <目标文件夹ID>}``。
+        - ``dst``=null 表示追加到目标文件夹末尾（保留原顺序）。
+        - ``src`` 为待移动项数组，每项 ``{"type", "id"}``；``type`` 支持 ``"doc"``
+          / ``"folder"``。
+        - ``folderId`` 为目标文件夹 ID（根目录用 ``"0"``）。
         """
         self._request(*ENDPOINTS["move"], json={
-            "id": item_id,
-            "folderId": target_folder_id
+            "dst": None,
+            "src": [{"type": item_type, "id": item_id}],
+            "folderId": target_folder_id,
         })
 
     def rename_doc(self, doc_id: str, new_name: str) -> None:
