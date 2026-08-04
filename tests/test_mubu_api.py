@@ -696,6 +696,22 @@ class TestEnvFileLoading:
         c._load_env_file(path=env)
         assert os.getenv("MUBU_PHONE") == "13800000000"
 
+    def test_member_id_loaded_from_env_file(self, tmp_path, monkeypatch):
+        """v1.3.9：MUBU_MEMBER_ID 纳入 .env 允许列表，未设环境变量时补全。"""
+        monkeypatch.setattr(mubu_api.os, "environ", {})
+        tok = tmp_path / "tok.json"
+        monkeypatch.setattr(mubu.client, "TOKEN_FILE", tok)
+        envf = tmp_path / ".env.mubu"
+        envf.write_text(
+            "MUBU_PHONE=x\nMUBU_PASSWORD=y\nMUBU_MEMBER_ID=3830260985345232\n",
+            encoding="utf-8",
+        )
+        with mock.patch.object(mubu.client, "ENV_FILE", envf):
+            c = MubuClient()
+        assert c.member_id == "3830260985345232"
+        # 变量已被补全进环境（便于 build_update_event / save_doc 取用）
+        assert os.getenv("MUBU_MEMBER_ID") == "3830260985345232"
+
 
 # --------------------------------------------------------------------------- #
 # 11. M2 T5 — Token 文件权限 600（_save_token 原子写后 chmod）
@@ -887,16 +903,34 @@ class TestApiMethodPayloads:
         }
 
     @responses.activate
-    def test_save_doc_body_with_name(self, isolated_client):
+    def test_save_doc_body_with_events_and_name(self, isolated_client):
         captured = {}
 
         def cb(request):
             captured["body"] = json.loads(request.body)
+            captured["headers"] = dict(request.headers)
             return (200, {}, json.dumps({"code": 0, "data": {}}))
 
-        responses.add_callback(responses.POST, f"{BASE_URL}/doc/save", callback=cb)
-        isolated_client.save_doc("D9", "content-here", name="Renamed")
-        assert captured["body"] == {"id": "D9", "content": "content-here", "name": "Renamed"}
+        responses.add_callback(responses.POST, f"{BASE_URL}/colla/events", callback=cb)
+        event = isolated_client.build_update_event(
+            {"nodes": [{"id": "n1", "text": "A"}]}, "D9")
+        isolated_client.member_id = "M1"
+        # name 走独立 rename_doc 端点（不塞进 colla/events 的 nameChanged 事件）
+        with mock.patch.object(isolated_client, "rename_doc") as mrename:
+            isolated_client.save_doc("D9", events=[event], version=3, name="Renamed")
+        # 内容保存：colla/events，events 不含 nameChanged
+        assert captured["body"] == {
+            "memberId": "M1",
+            "type": "CHANGE",
+            "version": 3,
+            "documentId": "D9",
+            "events": [event],
+        }
+        assert "name" not in captured["body"]
+        # 改名被分派到独立端点
+        mrename.assert_called_once_with("D9", "Renamed")
+        # 每文档独立的 x-reg-entrance（覆盖 _get_headers 的固定值）
+        assert captured["headers"]["x-reg-entrance"] == "https://mubu.com/app/edit/home/D9"
 
     @responses.activate
     def test_save_doc_body_without_name(self, isolated_client):
@@ -904,12 +938,67 @@ class TestApiMethodPayloads:
 
         def cb(request):
             captured["body"] = json.loads(request.body)
+            captured["headers"] = dict(request.headers)
             return (200, {}, json.dumps({"code": 0, "data": {}}))
 
-        responses.add_callback(responses.POST, f"{BASE_URL}/doc/save", callback=cb)
-        isolated_client.save_doc("D9", "x")
-        assert captured["body"] == {"id": "D9", "content": "x"}
+        responses.add_callback(responses.POST, f"{BASE_URL}/colla/events", callback=cb)
+        event = isolated_client.build_update_event(
+            {"nodes": [{"id": "n1", "text": "A"}]}, "D9")
+        isolated_client.member_id = "M1"
+        isolated_client.save_doc("D9", events=[event], version=3)
+        assert captured["body"] == {
+            "memberId": "M1",
+            "type": "CHANGE",
+            "version": 3,
+            "documentId": "D9",
+            "events": [event],
+        }
         assert "name" not in captured["body"]
+        assert captured["headers"]["x-reg-entrance"] == "https://mubu.com/app/edit/home/D9"
+
+    @responses.activate
+    def test_save_doc_auto_fetches_version_and_definition(self, isolated_client):
+        """save_doc 不传 events/version 时，自动拉取 baseVersion 与当前 definition，
+        构造幂等全量回写（touch）。"""
+        captured = {}
+        definition = json.dumps({"nodes": [{"id": "n1", "text": "A"}]})
+        responses.add(
+            responses.POST, f"{BASE_URL}/document/edit/get",
+            json={"code": 0, "data": {"name": "T", "baseVersion": 7, "definition": definition}},
+            status=200,
+            match=[matchers.json_params_matcher(
+                {"docId": "D9", "password": "", "isFromDocDir": True})],
+        )
+
+        def cb(request):
+            captured["body"] = json.loads(request.body)
+            return (200, {}, json.dumps({"code": 0, "data": {}}))
+
+        responses.add_callback(responses.POST, f"{BASE_URL}/colla/events", callback=cb)
+        isolated_client.member_id = "M1"
+        isolated_client.save_doc("D9")
+        assert captured["body"]["version"] == 7
+        assert captured["body"]["documentId"] == "D9"
+        update_event = captured["body"]["events"][0]
+        assert update_event["name"] == "update"
+        root = update_event["updated"][0]["updated"]
+        assert root["id"] == "D9"
+        assert root["children"] == [{"id": "n1", "text": "A"}]
+        # 幂等：updated == original
+        assert update_event["updated"][0]["updated"] == update_event["updated"][0]["original"]
+
+    def test_build_update_event_shape(self, isolated_client):
+        """build_update_event 形状：单个 update 事件，root 节点 children = 顶层 nodes，
+        updated 与 original 同构（幂等写回）。"""
+        event = isolated_client.build_update_event(
+            {"nodes": [{"id": "n1", "text": "A", "children": []}]}, "D9")
+        assert event["name"] == "update"
+        pair = event["updated"][0]
+        assert pair["updated"]["id"] == "D9"
+        assert pair["updated"]["children"] == [{"id": "n1", "text": "A", "children": []}]
+        assert isinstance(pair["updated"]["modified"], int)
+        # 幂等：updated 与 original 完全一致
+        assert pair["updated"] == pair["original"]
 
     @responses.activate
     def test_delete_body(self, isolated_client):
@@ -1482,39 +1571,33 @@ class TestExportTree:
 
 
 class TestRename:
-    def test_rename_doc_calls_save_with_name(self):
+    def test_rename_doc_uses_list_rename_doc_endpoint(self):
+        """rename_doc 走独立端点 /list/rename_doc（真正的改名 API），
+        而非把 nameChanged 塞进 colla/events（后者仅用于协同同步，显式改名被拒）。"""
         client = MubuClient()
-        # get_doc 真实返回形状 {"name", "nodes":[...]}（与 rename_doc 内部依赖一致）
-        doc = {"name": "Old", "nodes": [{"text": "Old", "children": []}]}
-        with mock.patch.object(client, "get_doc", return_value=doc) as mget, \
-             mock.patch.object(client, "save_doc") as msave:
+        with mock.patch.object(client, "_request") as mreq:
+            mreq.return_value = {"code": 0, "data": {}}
             client.rename_doc("d1", "New Name")
-        mget.assert_called_once_with("d1")
-        msave.assert_called_once()
-        args, kwargs = msave.call_args
-        assert "d1" in args
-        assert kwargs.get("name") == "New Name"
+        mreq.assert_called_once()
+        args, kwargs = mreq.call_args
+        assert args[0] == "POST"
+        assert args[1] == "/list/rename_doc"
+        # 注意字段是 documentId（不是 id；id 会返回 code 5）
+        assert kwargs["json"] == {"documentId": "d1", "name": "New Name"}
 
-    def test_rename_doc_sends_definition_shape(self):
-        """回归：rename_doc 回写的 content 必须是 definition JSON 字符串
-        {"nodes": [...]}（与 get_doc 返回的 nodes 同构），而非带 name 的
-        get_doc 整体包装 {"name":..., "nodes":...}。"""
+    def test_rename_doc_sends_document_id_and_name(self):
         client = MubuClient()
-        doc = {
-            "name": "Old",
-            "nodes": [
-                {"id": "n1", "text": "A", "children": [{"id": "n2", "text": "B"}]},
-            ],
-        }
-        with mock.patch.object(client, "get_doc", return_value=doc), \
-             mock.patch.object(client, "save_doc") as msave:
-            client.rename_doc("d1", "New Name")
-        args, kwargs = msave.call_args
-        content = json.loads(args[1])
-        # 必须是纯 definition 形状，不能含 "name" 包装
-        assert content == {"nodes": doc["nodes"]}
-        assert "name" not in content
-        assert kwargs.get("name") == "New Name"
+        captured = {}
+
+        def fake_request(method, endpoint, **kwargs):
+            captured["endpoint"] = endpoint
+            captured["json"] = kwargs.get("json")
+            return {"code": 0, "data": {}}
+
+        with mock.patch.object(client, "_request", side_effect=fake_request):
+            client.rename_doc("abc123", "Renamed Title")
+        assert captured["endpoint"] == "/list/rename_doc"
+        assert captured["json"] == {"documentId": "abc123", "name": "Renamed Title"}
 
     def test_rename_folder_uses_update_endpoint(self):
         client = MubuClient()

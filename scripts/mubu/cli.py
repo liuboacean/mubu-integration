@@ -220,19 +220,21 @@ def main() -> None:
             file_path = args.file
             if md_path:
                 safe = _safe_local_path(md_path)
-                # save_doc 的 content 必须是 definition JSON 字符串 {"nodes":[...]}，
-                # 与 get_doc 返回的 nodes 同构；markdown_to_doc 返回 {"node":{...}}，
-                # 此处取其根节点包成单顶层节点的 definition。
+                # markdown_to_doc 返回 {"node":{...}}，取其根节点包成单顶层节点的
+                # definition（{"nodes":[...]}），与 get_doc 返回的 nodes 同构。
                 md_doc = markdown_to_doc(safe.read_text(encoding="utf-8"))
-                content = json.dumps({"nodes": [md_doc.get("node")]}, ensure_ascii=False)
+                new_def = {"nodes": [md_doc.get("node")]}
             elif file_path:
                 safe = _safe_local_path(file_path)
-                content = safe.read_text(encoding="utf-8")
+                # 文件内容须为 definition JSON（{"nodes":[...]}）
+                new_def = json.loads(safe.read_text(encoding="utf-8"))
             elif args.content:
-                content = args.content
+                new_def = json.loads(args.content)
             else:
-                content = sys.stdin.read()
-            client.save_doc(args.doc_id, content)
+                new_def = json.loads(sys.stdin.read())
+            # 以新 definition 全量覆盖写回（事件契约见 client.build_update_event）
+            event = client.build_update_event(new_def, args.doc_id)
+            client.save_doc(args.doc_id, events=[event])
             print("保存成功")
 
         elif args.command == "delete":

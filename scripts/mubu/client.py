@@ -45,10 +45,16 @@ class MubuClient:
         self.token = None
         self.user_id = None
         self.username = None
+        self.member_id = None  # v1.3.9：colla 会话 id，由 _load_token / 环境变量补全
         self.expires_at = 0  # Token 过期时间戳（秒）
         # P2 #22：复用 requests.Session 连接池，search 多请求场景下避免每次新建连接
         self._session = requests.Session()
-        self._load_token()
+        self._load_token()  # 先还原 token 缓存中的 member_id（若有）
+        # v1.3.9：memberId 为幕布 colla（协同）命名空间下的每账号会话 id，
+        # 既非登录 id 也非 JWT sub，无法经任何 API 反查；来源优先级：
+        # 环境变量 MUBU_MEMBER_ID（~/.workbuddy/.env.mubu）> token 缓存兜底。
+        if not self.member_id:
+            self.member_id = os.getenv("MUBU_MEMBER_ID")
         # 排障手 move-sign 第 1 步：模拟浏览器 window.uniqueId / 会话的稳定标识，
         # 整个客户端生命周期内不变，用于对齐网页端请求头以平抑 code:17（真机待验证）。
         self._client_unique_id = str(uuid.uuid4())
@@ -83,7 +89,7 @@ class MubuClient:
                 key = key.strip()
                 value = value.strip().strip('"').strip("'")
                 # 仅在环境变量未设置时补全
-                if key in ("MUBU_PHONE", "MUBU_PASSWORD") and not os.getenv(key):
+                if key in ("MUBU_PHONE", "MUBU_PASSWORD", "MUBU_MEMBER_ID") and not os.getenv(key):
                     os.environ[key] = value
         except Exception:
             # 加载失败不影响主流程，后续 login 会提示设置环境变量
@@ -99,6 +105,7 @@ class MubuClient:
                     self.token = data.get("token")
                     self.user_id = data.get("user_id")
                     self.username = data.get("username")
+                    self.member_id = data.get("member_id")
                     self.expires_at = expires_at
                     return True
             except Exception:
@@ -116,6 +123,7 @@ class MubuClient:
             "token": self.token,
             "user_id": self.user_id,
             "username": self.username,
+            "member_id": self.member_id,
             "expires_at": self.expires_at
         }
         with _token_file_lock():
@@ -380,33 +388,84 @@ class MubuClient:
         definition = json.loads(data["definition"])
         return {"name": data.get("name"), "nodes": definition.get("nodes", [])}
 
-    def save_doc(self, doc_id: str, content: str, name: Optional[str] = None) -> None:
-        """保存/更新文档内容。
+    def build_update_event(self, doc_definition: Dict, doc_id: str) -> Dict:
+        """构建 colla/events 的单个 ``update`` 事件：以当前内容幂等覆盖当前内容。
+
+        形状（逆向自网页端 DocEditor chunk ``ti()`` 序列化器，2026-08-04 抓包复核）：
+            ``{"name": "update",
+                "updated": [{"updated": <rootNode>, "original": <rootNode>}]}``
+
+        - ``rootNode`` 为文档根节点：``id = doc_id``，``children = 顶层 nodes``。
+        - ``updated`` 与 ``original`` 同构 ⇒ 服务端视作无结构变化的幂等写回
+          （内容不变），对应网页端「保存当前大纲」的 changeset。
+        - 真实的节点序列化（含 ``children`` 递归、``text``/``note`` 字符串透传）
+          由网页端 ``tr()`` 完成；此处给出的 node 已是符合服务端契约的纯 dict，
+          直接作为 ``updated``/``original`` 负载即可。
+
+        Args:
+            doc_definition: 文档 definition（``json.loads(get_doc 的 definition)``），
+                形如 ``{"nodes": [...]}``。
+            doc_id: 文档 ID（作为 rootNode 的 id）。
+        """
+        nodes = doc_definition.get("nodes", []) if isinstance(doc_definition, dict) else []
+        root = {"id": doc_id, "children": nodes, "modified": int(time.time() * 1000)}
+        return {"name": "update", "updated": [{"updated": root, "original": root}]}
+
+    def save_doc(self, doc_id: str, events: Optional[List[Dict]] = None,
+                 version: Optional[int] = None, name: Optional[str] = None) -> None:
+        """通过 colla/events 持久化文档变更（端点已 2026-08-04 真机验证）。
 
         Args:
             doc_id: 文档 ID
-            content: 文档正文，必须是 **definition JSON 字符串**，即
-                ``json.dumps({"nodes": [...]}, ensure_ascii=False)`` —— 与 get_doc
-                返回的 ``nodes`` 同构（幕布大纲节点数组）。
-                注意：不要传纯 Markdown 文本，也不要传 get_doc 的整体返回值
-                ``{"name":..., "nodes":...}``（那是带 name 的包装，不是 definition）。
-            name: 可选，更新文档名称（作为顶层字段与 content 并列发送）。
+            events: 预构建的 changeset 事件列表；每个元素是形如
+                ``{"name": "update", "updated": [{"updated": node, "original": node}]}``
+                的字典，或由 ``build_update_event`` 生成。也可为
+                ``{"name": "nameChanged", "changed": "新标题"}`` 等。
+                不传（None）则对当前文档内容做**幂等全量回写**（touch，内容不变）。
+            version: 文档版本号（= get_doc 返回的 ``baseVersion``）。
+                不传则自动拉取当前文档以取得版本与（按需）内容。
+            name: 可选，随本次保存一并改文档名（追加一个 ``nameChanged`` 事件）。
 
-        注意：真机验证显示 POST /doc/save 对来自本客户端的请求一律返回
-        ``code:17 / illegal request``（其它写接口如 create_doc 正常）。续跑排障手
-        （v1.3.4 收尾）已逐一排除 payload 因素：分别试过 ``{id,content}``、
-        ``{id,content,name}``、``{id,definition}``、``{id,content,name,cover}``、
-        以及把整体 ``{"name":...,"nodes":...}`` 当 content 包回去共 5 种 body，
-        全部同样报 illegal request；客户端已带浏览器 UA / Origin / Referer。
-        由此定位根因为**幕布对该接口启用了服务端请求签名/反爬校验**，与请求体
-        形状无关——本方法发出的 ``{"id","content"}`` 即为正确契约形态，无法在
-        客户端侧绕过该签名。端到端 round-trip 当前不可达，但调用方只要传正确的
-        definition JSON 字符串（见 content 说明）即符合接口契约。
+        真机契约（逆向自网页端 DocEditor chunk ``ts()`` 构建器 + 抓包复核）：
+            POST /v3/api/colla/events
+            body = {
+              "memberId": <colla 会话 id>,
+              "type": "CHANGE",
+              "version": <baseVersion>,
+              "documentId": <doc_id>,
+              "events": [ ... ]
+            }
+        每文档 ``x-reg-entrance`` 必须为 ``https://mubu.com/app/edit/home/<doc_id>``，
+        与网页端编辑页一致（经 2026-08-04 抓包复核）。
+
+        ``name`` 参数：显式重命名走独立端点 ``/list/rename_doc``（见 ``rename_doc``），
+        不要把它塞进 colla/events 的 ``nameChanged`` 事件——该事件仅用于协同实时同步，
+        显式改名会被服务端拒绝 illegal request（已真机验证 2026-08-04）。
         """
-        data = {"id": doc_id, "content": content}
+        if version is None or events is None:
+            raw = self._request(*ENDPOINTS["get_doc"], json={
+                "docId": doc_id,
+                "password": "",
+                "isFromDocDir": True,
+            })
+            if version is None:
+                version = raw.get("baseVersion")
+            if events is None:
+                definition = json.loads(raw["definition"])
+                events = [self.build_update_event(definition, doc_id)]
+        payload = {
+            "memberId": self.member_id or "",
+            "type": "CHANGE",
+            "version": version,
+            "documentId": doc_id,
+            "events": events,
+        }
+        # 每文档独立设置 x-reg-entrance（覆盖 _get_headers 的固定值）
+        headers = {"x-reg-entrance": f"https://mubu.com/app/edit/home/{doc_id}"}
+        self._request(*ENDPOINTS["save_doc"], json=payload, headers=headers)
+        # 改名走独立端点（content 保存与改名是两个正交操作）
         if name:
-            data["name"] = name
-        self._request(*ENDPOINTS["save_doc"], json=data)
+            self.rename_doc(doc_id, name)
 
     def delete_folder(self, folder_id: str) -> None:
         """删除文件夹（已真机验证：POST /list/delete_folder，body {"id": ...}）。"""
@@ -524,23 +583,15 @@ class MubuClient:
         })
 
     def rename_doc(self, doc_id: str, new_name: str) -> None:
-        """重命名文档（基于现有 save_doc 的 name 参数）。
+        """重命名文档（真实端点 POST /list/rename_doc，2026-08-04 抓包复核）。
 
-        ⚠️ 真机受限：rename_doc 依赖 save_doc 回写，而 save_doc 在真机被服务端
-        请求签名/反爬校验拒绝（``code:17 / illegal request``，与请求体形状无关，
-        见 ``save_doc`` docstring），因此 rename_doc 的端到端 round-trip 在真机
-        **不可达**，当前仅能在契约层面正确构造请求。待服务端对该客户端放行签名
-        后方可真机生效（届时无需改代码）。
-
-        先拉取文档内容，再用 save_doc 回写并携带新名称，实现 round-trip 重命名。
-
-        回写的正文必须是 definition JSON 字符串（``{"nodes": [...]}``），与
-        get_doc 返回的 ``nodes`` 同构；不要直接 ``json.dumps(doc)``（那会得到带
-        ``name`` 的包装 ``{"name":..., "nodes":...}``，不是幕布接受的 definition 形状）。
+        网页端重命名走独立 rename API，而非 colla/events 的 ``nameChanged`` 事件——
+        后者仅用于协同实时同步，显式重命名会被服务端拒绝 ``illegal request``
+        （已真机验证）。请求体形状：``{"documentId": <doc_id>, "name": <新名>}``
+        （注意字段是 ``documentId`` 不是 ``id``；``id`` 会返回 code 5 参数错误）。
+        成功响应为 ``{"version": <时间戳>}``。
         """
-        doc = self.get_doc(doc_id)
-        content = json.dumps({"nodes": doc["nodes"]}, ensure_ascii=False)
-        self.save_doc(doc_id, content, name=new_name)
+        self._request(*ENDPOINTS["rename_doc"], json={"documentId": doc_id, "name": new_name})
 
     def rename_folder(self, folder_id: str, new_name: str) -> None:
         """重命名文件夹（已真机验证：POST /list/rename_folder）。
