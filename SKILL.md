@@ -9,10 +9,10 @@ description: 幕布（mubu）与 Obsidian 集成：将幕布大纲导入 Obsidia
 
 ## 权限与安全边界
 本 Skill 以你的幕布账号身份操作**远程真实内容**，使用前请知悉其权限边界：
-- **读取**：仅读取环境变量 `MUBU_PHONE` / `MUBU_PASSWORD`（环境变量未设置时，才由仓库外的 `~/.workbuddy/.env.mubu` 补全，且不写回其它位置）。
+- **读取**：仅读取环境变量 `MUBU_PHONE` / `MUBU_PASSWORD` / `MUBU_MEMBER_ID`（环境变量未设置时，才由仓库外的 `~/.workbuddy/.env.mubu` 补全；`MUBU_MEMBER_ID` 即幕布 colla 成员 ID，仅 `save` 写回需要，登录后自动缓存到 `~/.mubu_token`）。
 - **写入**：仅在本地写入 Token 缓存文件 `~/.mubu_token`（权限 `0o600` + 跨进程 `fcntl` 锁），不写入其它文件。
 - **网络**：仅访问 `api2.mubu.com`（base URL 可由 `MUBU_BASE_URL` 覆盖，但仅限 `mubu.com` 家族域名，防 MITM），**无第三方服务、无遥测、无数据外发**。
-- **写操作需确认**：真实会改动幕布内容的写操作为 `create`（新建）、`rename_folder`（重命名文件夹）、`purge`（彻底删除，唯一真实调用服务端删除，不可逆）；`delete` 现为**软删除**（仅标记进本地回收站，云端副本仍在）。⚠️ `save` / `move` / `rename_doc`（doc 重命名）在真机被服务端反爬签名拒绝或返回 `illegal request`，**当前不可用**。所有真实写操作均需显式传 `--yes` 才执行，否则中止并提示。
+- **写操作需确认**：真实会改动幕布内容的写操作为 `create`（新建）、`rename_folder`（重命名文件夹）、`save`（保存文档，端点 `/colla/events`，需 `member_id`）、`move`（移动，端点 `/list/custom/drag`）、`rename_doc`（文档重命名，端点 `/list/rename_doc`）、`purge`（彻底删除，唯一真实调用服务端删除，不可逆）；`delete` 现为**软删除**（仅标记进本地回收站，云端副本仍在）。`save` / `move` / `rename_doc` 已在 v1.3.9 经真机验证可用。所有真实写操作均需显式传 `--yes` 才执行，否则中止并提示。
 - **信任边界**：Skill 不读取你的其它本地文件、不执行与幕布无关的 shell 命令；它只做「登录 → 读写你的幕布文档」这一件事。
 
 ## 功能概览
@@ -25,10 +25,10 @@ description: 幕布（mubu）与 Obsidian 集成：将幕布大纲导入 Obsidia
 | 创建文档 | `POST /list/create_doc` | 创建新的大纲文档 |
 | 获取列表 | `POST /list/get` | 获取文件夹下的文档列表 |
 | 获取文档 | `POST /document/edit/get` | 获取文档详细内容（真实端点；body 为 docId+password+isFromDocDir，返回 data.definition 为 JSON 字符串需二次解析） |
-| 更新文档 | `POST /doc/save` | 保存/更新文档内容（⚠️ 真机被服务端反爬签名拒绝 `code:17 / illegal request`，round-trip 写回不可达）|
+| 更新文档 | `POST /colla/events` | 保存/更新文档内容（v1.3.9 起可用；colla 协同端点，`events` 承载 changeset；需 `member_id`，私人文档由 `MUBU_MEMBER_ID` 或 token 缓存提供）|
 | 删除文档 | `POST /list/delete_doc` | 删除文档（按类型区分端点） |
 | 删除文件夹 | `POST /list/delete_folder` | 删除文件夹（原 `/list/delete` 实测非法，已弃用） |
-| 移动文档 | `POST /list/move` | 移动文档到其他文件夹（⚠️ 真机实测返回 `illegal request`，当前不可用，待抓包确认端点）|
+| 移动文档 | `POST /list/custom/drag` | 移动文档/文件夹到其他位置（v1.3.9 起可用；body `dst/src/folderId`，已真机验证）|
 | 导出 Markdown | 本地转换 | 将大纲结构转换为 Markdown |
 
 ## API 基础信息
@@ -44,6 +44,8 @@ description: 幕布（mubu）与 Obsidian 集成：将幕布大纲导入 Obsidia
 ```bash
 export MUBU_PHONE="your_phone_number"    # 幕布账号手机号
 export MUBU_PASSWORD="your_password"      # 幕布账号密码
+# 可选：幕布 colla 成员 ID（仅 save 写回需要；登录后自动缓存到 ~/.mubu_token，一般无需手动设置）
+export MUBU_MEMBER_ID="your_collab_member_id"
 ```
 
 > 切勿在脚本或代码中硬编码明文密码；凭据仅通过环境变量或仓库外的
@@ -221,10 +223,10 @@ def markdown_to_doc(md):
 | `restore <id>` | 从本地回收站恢复（仅移除标记，零服务端调用） |
 | `purge <id> --yes` | **彻底删除（不可逆）**：调用服务端真实删除 API 后移除本地标记；必须显式 `--yes` 才执行 |
 | `trash` | 列出本地回收站中已软删除的项 |
-| `move <item_id> --target <folder_id>` | 移动文档到其他文件夹（⚠️ 该端点**尚未经真机验证**，可能返回 illegal request，慎用） |
+| `move <item_id> --target <folder_id> [--type doc\|folder]` | 移动文档/文件夹到其他位置（v1.3.9 起可用，端点 `/list/custom/drag`，已真机验证）|
 | `search <关键字> [--max-depth N] [--limit N] [--include-trash]` | 按名称本地搜索文档/文件夹（递归遍历，大小写不敏感；`--include-trash` 包含已软删除项） |
 | `export-tree --folder <id> [--output <dir>] [--max-depth N]` | 递归导出整个文件夹树为嵌套 Markdown 文件 |
-| `rename <id> --name <新名> [--type doc\|folder]` | 重命名文档（`save_doc` name）或文件夹（已验证端点 `/list/rename_folder`，`folderId` 填自身 id）|
+| `rename <id> --name <新名> [--type doc\|folder]` | 重命名文档（`/list/rename_doc` 端点）或文件夹（已验证端点 `/list/rename_folder`，`folderId` 填自身 id）|
 | `opml <doc_id> [--format opml\|freeplane]` | 导出为 OPML 2.0 / FreeMind XML（兼容 XMind 等其它大纲工具）|
 
 ### 软删除 / 回收站（v1.3.5）
@@ -295,6 +297,8 @@ python3 scripts/mubu_api.py opml <doc_id> --format freeplane
 ```bash
 export MUBU_PHONE="你的手机号"
 export MUBU_PASSWORD="你的密码"
+# 可选：幕布 colla 成员 ID（仅 save 写回需要；登录后自动缓存到 ~/.mubu_token，一般无需手动设置）
+export MUBU_MEMBER_ID="你的幕布 colla 成员 ID"
 ```
 
 也可在 `~/.workbuddy/.env.mubu` 中配置（由 Skill 宿主加载为环境变量，且仅属主可读写）：
@@ -302,6 +306,8 @@ export MUBU_PASSWORD="你的密码"
 ```
 MUBU_PHONE=你的手机号
 MUBU_PASSWORD=你的密码
+# 可选：幕布 colla 成员 ID（仅 save 写回需要；登录后自动缓存，一般无需手动设置）
+MUBU_MEMBER_ID=你的幕布 colla 成员 ID
 ```
 
 ---
@@ -313,6 +319,7 @@ MUBU_PASSWORD=你的密码
 - 图片 / 附件类型节点不在本期 Markdown 往返范围内（会丢失媒体内容）。
 - 多个顶层标题导入时，首个为 root，其余作为 root 的 children；其后的列表项统一挂在
   root 下（规范未要求按标题再嵌套）。
+- `save`（文档保存）需要幕布 colla 成员 ID：私人文档的 `memberId` 任何 API 都不暴露，由 `MUBU_MEMBER_ID` 环境变量提供，或登录后随 Token 缓存写入 `~/.mubu_token`。缺失时会明确报错（不影响 `get` / `create` / `move` / `rename` 等其它操作）。v1.3.9 已修复 `save`（`/colla/events`）、`move`（`/list/custom/drag`）、doc `rename`（`/list/rename_doc`）的真机可用性。
 
 ---
 

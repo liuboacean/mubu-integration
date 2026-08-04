@@ -286,3 +286,20 @@ ClawHub SkillSpector 复审（GO；1 项 High 降为 Medium）3 项真实发现�
 - ⚠️ 已知限制：`memberId` 无法经 API 发现，个人文档 `save_doc` 需设置 `MUBU_MEMBER_ID`（或缓存 `member_id`），否则保存失败
 - test: 112 passed（0 失败，较 109 新增 3 例，无回归）
 
+## M20 (v1.3.10) — 文档刷新（2026-08-04，发布）
+
+纯文档同步，无代码/行为变更。修正 v1.3.9 之前遗留、与已发布 CHANGELOG M19 自相矛盾的「写回类操作不可用」错误声明，并补充 `MUBU_MEMBER_ID` 配置说明。
+
+- **doc(SKILL.md / README.md): 移除过时「不可用」声明**：更新 `save`（`/colla/events`）、`move`（`/list/custom/drag`）、doc `rename`（`/list/rename_doc`）均为 v1.3.9 已真机验证可用；删除旧的 `code:17 / illegal request 当前不可用` 警示。
+- **doc: 补充 `MUBU_MEMBER_ID` 配置**：在两文档的凭据配置章节新增可选环境变量 `MUBU_MEMBER_ID`（幕布 colla 成员 ID，仅 `save` 写回需要，登录后自动缓存到 `~/.mubu_token`，一般无需手动设置）。
+- **doc: 测试计数更新**：README 测试用例数由 100 更正为 112（与 v1.3.9 实测一致）。
+
+## v1.3.10（本期发布版本 · 2026-08-04）
+
+本期为文档刷新（GitHub tag v1.3.10）。详见上方 M20。
+
+- doc: 移除 SKILL.md / README.md 中遗留的「save/move/rename 真机不可用」错误声明（与已发布 M19 矛盾）
+- doc: 补充 `MUBU_MEMBER_ID` 配置说明（`save` 写回前置条件）
+- doc: README 测试计数 100 → 112
+- 无代码/行为变更
+
