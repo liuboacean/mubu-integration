@@ -105,6 +105,9 @@ def main() -> None:
         "purge", help="彻底删除（不可逆，调用服务端 + 移除本地标记）"
     )
     purge_parser.add_argument("id", help="文档或文件夹ID")
+    purge_parser.add_argument("--type", choices=["doc", "folder"], default=None,
+                              help="对象类型（仅当回收站记录缺失时必填）："
+                                   "doc=文档 / folder=文件夹")
     purge_parser.add_argument("--yes", action="store_true",
                               help="确认执行不可逆彻底删除（必须显式传参）")
 
@@ -143,7 +146,8 @@ def main() -> None:
     rename_parser.add_argument("id", help="文档或文件夹ID")
     rename_parser.add_argument("--name", required=True, help="新名称")
     rename_parser.add_argument("--type", choices=["doc", "folder"], default="doc",
-                               help="对象类型：doc=走 save_doc name；folder=走推测端点 /list/update_folder")
+                               help="对象类型：doc=走 save_doc name（⚠️ 真机受限）；"
+                                    "folder=走已验证端点 /list/rename_folder（folderId 填自身 id）")
 
     # OPML / FreeMind 导出（Roadmap: 兼容其它大纲工具）
     opml_parser = subparsers.add_parser("opml", help="将文档导出为 OPML / FreeMind XML")
@@ -260,7 +264,7 @@ def main() -> None:
                     "确认请加 --yes 重新执行。", args.id,
                 )
                 sys.exit(1)
-            client.purge_item(args.id)
+            client.purge_item(args.id, item_type=args.type)
             print(f"已彻底删除: {args.id}（不可恢复）")
 
         elif args.command == "trash":
@@ -308,7 +312,7 @@ def main() -> None:
             if args.type == "doc":
                 client.rename_doc(args.id, args.name)
             else:
-                # 文件夹重命名走逆向推测端点，真实环境需验证
+                # 文件夹重命名走已验证端点 /list/rename_folder（M12 真机验证）
                 client.rename_folder(args.id, args.name)
             print(f"重命名成功: {args.id} -> {args.name}")
 

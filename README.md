@@ -63,8 +63,8 @@ scripts/
 ### 核心功能
 
 - 🔐 **登录认证** —— 手机号 + 密码登录，Token 本地缓存（文件权限 `0o600`）
-- 📁 **文件夹管理** —— 创建、列表、删除、移动
-- 📄 **文档管理** —— 创建、获取、保存、删除
+- 📁 **文件夹管理** —— 创建、列表、删除（⚠️ `move` 真机返回 `illegal request`，当前不可用）
+- 📄 **文档管理** —— 创建、获取、删除（⚠️ `save` / doc 重命名真机被反爬签名拒绝，写回不可达）
 - 📋 **大纲导出** —— 导出为 Markdown 格式（往返保真）
 
 ### 版本亮点（v1.2.0）
@@ -86,7 +86,7 @@ scripts/
 | 里程碑 | 能力 | 说明 |
 | :--- | :--- | :--- |
 | **Roadmap · 整树导出** | 🌳 `export-tree` | 递归导出整个文件夹树为嵌套 `.md`（子文件夹→子目录），单点失败不阻断遍历 |
-| **Roadmap · 重命名** | ✏️ `rename` | 文档走 `save_doc` name（round-trip 保内容）；文件夹走已验证端点 `/list/rename_folder`（`folderId` 填自身 id） |
+| **Roadmap · 重命名** | ✏️ `rename` | 文档走 `save_doc` name（⚠️ 真机受限：依赖 `save_doc`，被反爬签名拒绝 `illegal request`）；文件夹走已验证端点 `/list/rename_folder`（`folderId` 填自身 id） |
 | **Roadmap · 互操作** | 🔁 OPML / FreeMind | `opml <doc_id> --format opml\|freeplane` 导出为 OPML 2.0 / FreeMind XML，兼容 XMind 等大纲工具 |
 | **Roadmap · 大重构** | 📦 模块拆分 | `scripts/mubu_api.py` 拆分为 `scripts/mubu/`（config/convert/client/cli），shim 向后兼容，`import mubu_api` 与 `from mubu.client import MubuClient` 均可用——**93 用例通过，接口零破坏** |
 
@@ -248,14 +248,14 @@ python3 scripts/mubu_api.py get <doc_id>
 # 导出为 Markdown（往返保真，非占位）
 python3 scripts/mubu_api.py get <doc_id> --export markdown
 
-# 保存文档
+# 保存文档（⚠️ 真机受限：save_doc 被服务端反爬签名拒绝 code:17 illegal request，写回不可达）
 python3 scripts/mubu_api.py save <doc_id> --content "内容"
 python3 scripts/mubu_api.py save <doc_id> --file content.md
 
-# 从 Markdown 文件导入更新文档
+# 从 Markdown 文件导入更新文档（⚠️ 同上，真机写回不可达，仅供契约/本地验证）
 python3 scripts/mubu_api.py save <doc_id> --md outline.md
 
-# 移动文档到其他文件夹
+# 移动文档到其他文件夹（⚠️ 真机实测返回 illegal request，当前不可用，待抓包确认端点）
 python3 scripts/mubu_api.py move <doc_id> --target <folder_id>
 
 # 删除（软删除 → 本地回收站；执行前仍须确认目标 ID；必须显式 --yes；--type 默认 folder）
@@ -269,7 +269,7 @@ python3 scripts/mubu_api.py search "项目" --json
 # 递归导出整个文件夹树为嵌套 Markdown 文件（默认当前目录，--output 指定输出根）
 python3 scripts/mubu_api.py export-tree --folder <root_folder_id> --output ./backup
 
-# 重命名文档（走 save_doc 的 name 参数，round-trip 保内容）
+# 重命名文档（走 save_doc name，⚠️ 真机受限：依赖 save_doc，写回不可达）
 python3 scripts/mubu_api.py rename <doc_id> --name "新标题" --type doc
 
 # 重命名文件夹（已真机验证端点 /list/rename_folder，folderId 填自身 id）
@@ -282,7 +282,7 @@ python3 scripts/mubu_api.py opml <doc_id> --format freeplane
 
 ## Agent 触发词
 
-> 幕布、mubu、幕布大纲导入导出
+> 幕布、mubu、幕布导入 Obsidian、mubu 同步、幕布笔记导出
 
 当对话中出现以上关键词时，Skill 可被自动触发。
 
@@ -325,6 +325,7 @@ A：当前不支持。大纲折叠状态 `expand`、有序列表 `1.`、图片 /
 - 当前为 Markdown 导入/导出**往返保真**，**非**真正的双向同步（无 diff/merge，重复导入会生成新副本）；真正的双向同步（true-sync）不在本期范围。
 - 多个顶层标题导入时，首个为根，其余作为根的子节点。
 - `search` 为本地过滤：从根文件夹递归遍历所有子文件夹按名称匹配（大小写不敏感）。幕布无公开 `/search` 端点，故依赖本地遍历，文件夹极多时可能稍慢。
+- ⚠️ **写回类操作真机受限**：`save_doc` / doc `rename` 在真机被服务端请求签名/反爬校验拒绝（`code:17 / illegal request`，与请求体形状无关），端到端 round-trip 写回不可达；`move` 真机返回 `illegal request`，真实端点未知。当前 Skill **聚焦读取 / 导入 / 导出**（`list` / `search` / `get_doc` / `create` / `export-tree` / `opml` / `rename_folder` 已验证可用），上述写回操作请勿在生产依赖，待服务端放行签名或抓包确认 `move` 端点后再启用。
 
 > 说明：v1.3.5 已包含 M1–M9 及 P2 全部能力，并新增软删除 / 本地回收站（`delete`→软删除、`restore` 恢复、`purge` 彻底删除、`trash` 列表），以上为功能边界而非未完成项。
 

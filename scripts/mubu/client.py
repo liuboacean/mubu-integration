@@ -452,16 +452,25 @@ class MubuClient:
             return True
         return False
 
-    def purge_item(self, item_id: str) -> None:
+    def purge_item(self, item_id: str, item_type: Optional[str] = None) -> None:
         """彻底删除：唯一不可逆操作。
 
-        先从回收站读出类型，调用真实删除 API（delete_doc / delete_folder），
-        成功后移除本地标记。调用方须已通过 CLI --yes 守卫确认。
+        优先从回收站快照读取 item_type；若回收站记录缺失且调用方未显式
+        指定 item_type，**不默认 folder**，而是抛出明确错误要求显式指定，
+        杜绝把 doc 当 folder 误删（``/list/delete_folder`` 端点与文档 id 不匹配）。
+        调用方须已通过 CLI --yes 守卫确认。
         """
         trash = self._load_trash()
         item = trash.get(item_id)
-        item_type = item.get("type") if item else "folder"
-        if item_type == "doc":
+        # 优先回收站记录；缺失时回退到调用方显式传入的 item_type
+        resolved_type = (item or {}).get("type") if item else item_type
+        if resolved_type not in ("doc", "folder"):
+            raise MubuError(
+                f"无法确定 {item_id} 的类型以执行彻底删除：回收站记录缺失且未显式"
+                f"指定 --type（doc/folder）。请使用 purge <id> --type <doc|folder> --yes "
+                f"显式指定后再执行，避免误删。"
+            )
+        if resolved_type == "doc":
             self.delete_doc(item_id)
         else:
             self.delete_folder(item_id)
@@ -478,7 +487,14 @@ class MubuClient:
         return item_id in self._load_trash()
 
     def move(self, item_id: str, target_folder_id: str) -> None:
-        """移动文档到其他文件夹"""
+        """移动文档到其他文件夹。
+
+        ⚠️ 真机不可用（待抓包）：``/list/move`` 及 ``/list/move_folder`` /
+        ``/list/move_doc`` 等多种变体（不同字段名 folderId/toFolderId/parentId/
+        targetId）在真机均返回 ``code:17 / illegal request``，真实端点未知
+        （M12/M13 实测）。当前保留实现仅供结构完整，**不要在生产依赖**；待浏览器
+        DevTools 抓包确认正确端点后再修。
+        """
         self._request(*ENDPOINTS["move"], json={
             "id": item_id,
             "folderId": target_folder_id
@@ -486,6 +502,12 @@ class MubuClient:
 
     def rename_doc(self, doc_id: str, new_name: str) -> None:
         """重命名文档（基于现有 save_doc 的 name 参数）。
+
+        ⚠️ 真机受限：rename_doc 依赖 save_doc 回写，而 save_doc 在真机被服务端
+        请求签名/反爬校验拒绝（``code:17 / illegal request``，与请求体形状无关，
+        见 ``save_doc`` docstring），因此 rename_doc 的端到端 round-trip 在真机
+        **不可达**，当前仅能在契约层面正确构造请求。待服务端对该客户端放行签名
+        后方可真机生效（届时无需改代码）。
 
         先拉取文档内容，再用 save_doc 回写并携带新名称，实现 round-trip 重命名。
 

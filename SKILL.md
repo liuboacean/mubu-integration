@@ -1,6 +1,6 @@
 ---
 name: mubu-integration
-description: 幕布笔记集成，支持登录认证、文档管理、文件夹操作、大纲导入/导出等功能。触发词：幕布、mubu、幕布大纲导入导出
+description: 幕布（mubu）与 Obsidian 集成：将幕布大纲导入 Obsidian、把 Markdown 同步到幕布、查询/导出幕布笔记。触发词：幕布、mubu、幕布导入 Obsidian、mubu 同步、幕布笔记导出
 ---
 
 # 幕布集成 Skill
@@ -12,7 +12,7 @@ description: 幕布笔记集成，支持登录认证、文档管理、文件夹�
 - **读取**：仅读取环境变量 `MUBU_PHONE` / `MUBU_PASSWORD`（环境变量未设置时，才由仓库外的 `~/.workbuddy/.env.mubu` 补全，且不写回其它位置）。
 - **写入**：仅在本地写入 Token 缓存文件 `~/.mubu_token`（权限 `0o600` + 跨进程 `fcntl` 锁），不写入其它文件。
 - **网络**：仅访问 `api2.mubu.com`（base URL 可由 `MUBU_BASE_URL` 覆盖，但仅限 `mubu.com` 家族域名，防 MITM），**无第三方服务、无遥测、无数据外发**。
-- **破坏性操作需确认**：`save` / `move` 会修改你在幕布上的真实文档；`delete` 现为**软删除**（仅标记进本地回收站，云端副本仍在），`purge` 为唯一不可逆操作（真实调用服务端删除）。二者均需显式传 `--yes` 才执行，否则中止并提示。
+- **写操作需确认**：真实会改动幕布内容的写操作为 `create`（新建）、`rename_folder`（重命名文件夹）、`purge`（彻底删除，唯一真实调用服务端删除，不可逆）；`delete` 现为**软删除**（仅标记进本地回收站，云端副本仍在）。⚠️ `save` / `move` / `rename_doc`（doc 重命名）在真机被服务端反爬签名拒绝或返回 `illegal request`，**当前不可用**。所有真实写操作均需显式传 `--yes` 才执行，否则中止并提示。
 - **信任边界**：Skill 不读取你的其它本地文件、不执行与幕布无关的 shell 命令；它只做「登录 → 读写你的幕布文档」这一件事。
 
 ## 功能概览
@@ -25,10 +25,10 @@ description: 幕布笔记集成，支持登录认证、文档管理、文件夹�
 | 创建文档 | `POST /list/create_doc` | 创建新的大纲文档 |
 | 获取列表 | `POST /list/get` | 获取文件夹下的文档列表 |
 | 获取文档 | `POST /document/edit/get` | 获取文档详细内容（真实端点；body 为 docId+password+isFromDocDir，返回 data.definition 为 JSON 字符串需二次解析） |
-| 更新文档 | `POST /doc/save` | 保存/更新文档内容 |
+| 更新文档 | `POST /doc/save` | 保存/更新文档内容（⚠️ 真机被服务端反爬签名拒绝 `code:17 / illegal request`，round-trip 写回不可达）|
 | 删除文档 | `POST /list/delete_doc` | 删除文档（按类型区分端点） |
 | 删除文件夹 | `POST /list/delete_folder` | 删除文件夹（原 `/list/delete` 实测非法，已弃用） |
-| 移动文档 | `POST /list/move` | 移动文档到其他文件夹（⚠️ 端点未实测验证） |
+| 移动文档 | `POST /list/move` | 移动文档到其他文件夹（⚠️ 真机实测返回 `illegal request`，当前不可用，待抓包确认端点）|
 | 导出 Markdown | 本地转换 | 将大纲结构转换为 Markdown |
 
 ## API 基础信息
@@ -327,7 +327,7 @@ MUBU_PASSWORD=你的密码
 
 ## Agent 使用指引
 
-当用户提到幕布、mubu 相关操作（如登录、文档/文件夹管理、大纲导入导出）时，使用本 Skill 的脚本完成操作。
+当用户提到幕布、mubu 相关操作（如将幕布大纲导入 Obsidian、把 Markdown 同步到幕布、查询/导出幕布笔记）时，使用本 Skill 的脚本完成操作。
 
 ### 前置检查
 

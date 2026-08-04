@@ -1089,6 +1089,28 @@ class TestTrash:
         assert "trash1" in ids2
         assert "ok1" in ids2
 
+    @responses.activate
+    def test_purge_without_trash_record_requires_type(self, monkeypatch, tmp_path, capsys):
+        # v1.3.7 安全修复：回收站记录缺失且未显式 --type 时，必须拒绝而非默认 folder
+        # 不预写回收站（_load_trash 返回 {}），不注册任何删除端点
+        err = self._invoke(["purge", "idX", "--yes"], monkeypatch, tmp_path)
+        assert err is not None and err.code == 1
+        # 0 次网络请求（绝不能误走到 delete_folder）
+        assert len(responses.calls) == 0
+        captured = capsys.readouterr()
+        assert "类型" in captured.err
+
+    @responses.activate
+    def test_purge_explicit_type_doc_calls_delete_doc(self, monkeypatch, tmp_path):
+        # v1.3.7：回收站缺失但显式 --type doc → 调用 /list/delete_doc
+        responses.add(responses.POST, f"{BASE_URL}/list/delete_doc",
+                      json={"code": 0, "data": {}}, status=200)
+        err = self._invoke(["purge", "idX", "--type", "doc", "--yes"],
+                            monkeypatch, tmp_path)
+        assert err is None
+        assert len(responses.calls) == 1
+        assert responses.calls[0].request.url.endswith("/list/delete_doc")
+
 
 # --------------------------------------------------------------------------- #
 # 16. P0 #1 — login CLI：移除明文参数，凭据取自环境变量 / 交互式 getpass

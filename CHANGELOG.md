@@ -221,9 +221,29 @@ ClawHub SkillSpector 复审（GO；1 项 High 降为 Medium）3 项真实发现�
 以下为已识别、尚未排入实施的能力增强与重构方向，供后续迭代参考：
 
 - **模块拆分（排障手 #18）**：✅ 已在 M11 完成——`scripts/mubu_api.py` 拆分为 `scripts/mubu/`（config / convert / client / cli），`mubu_api.py` 保留为向后兼容 shim，93 用例通过。
-- **文件夹重命名 / 移动增强（产品官 #14）**：补全 `rename_folder` 等高层方法，提升目录管理能力。
-- **整树递归导出（产品官 #14）**：支持将整个文件夹树递归导出为单一 Markdown / JSON，便于整体备份。
+- **文件夹重命名 / 移动增强（产品官 #14）**：✅ 重命名已在 M10 完成（`rename_doc`/`rename_folder`，M12/M14 真机验证）；⚠️ 移动（`move`）端点仍待真机抓包（真机 `illegal request`），保持未实现。
+- **整树递归导出（产品官 #14）**：✅ 已在 M10 完成——`export_tree` 递归导出整个文件夹树为嵌套 Markdown（`export-tree` 子命令）。
 - **软删除 / 回收站（产品官 #14 P2）**：✅ 已在 M15/v1.3.5 完成——`delete` 改为本地软删除（仅标记进 `~/.workbuddy/.mubu_trash.json`，零网络），`restore` 恢复、`purge <id> --yes` 真实硬删、`trash` 列出；`list`/`search` 默认过滤已软删项。
-- **互操作导出（产品官 #25）**：导出支持 OPML / FreeMind 格式，便于导入到其他大纲工具。
+- **互操作导出（产品官 #25）**：✅ 已在 M10 完成——OPML 2.0 / FreeMind（`doc_to_opml`/`doc_to_freeplane` + `opml` 子命令），兼容 XMind 等其它大纲工具。
 - **依赖锁文件（排障手 #21）**：✅ 已在 M15/v1.3.5 完成——引入 `pip-tools`，`requirements.in`/`requirements-dev.in` 由 `pip-compile --generate-hashes` 生成精确版本 + 哈希锁文件，CI 校验漂移。
+
+## M17 (v1.3.7) — 文档/配置诚实度 + 触发词收敛 + dependabot 治理 + purge 安全加固（2026-08-04，仅本地提交）
+
+本期聚焦"降低偶发误激活 + 文档/代码诚实度 + 一处本地安全加固"，**无功能性回归**（purge 为本地安全加固，其余为文档/配置；未 push/tag/release）。
+
+- **Roadmap ✅ 同步**：原 Roadmap 区块的"文件夹重命名/移动增强"、"整树递归导出"、"互操作导出（OPML/FreeMind）"三项实为 M10 已完成能力，补充 ✅ 标记，消除与 CHANGELOG 历史段的矛盾（移动子项仍标 ⚠️ 待抓包）。
+- **README 诚实度**：命令参考 `save` / `rename` / `move` 行与「已知限制」处加注——`save_doc`/`rename_doc` 在真机被服务端反爬签名拒绝（`code:17 / illegal request`，round-trip 写回不可达），当前 skill 聚焦读取/导入/导出；`move` 真机实测 `illegal request`，当前不可用。特性亮点同步收敛写回类操作的措辞。
+- **触发词收敛**：SKILL.md frontmatter `description` 与 README「Agent 触发词」将宽泛的"幕布大纲导入导出"收窄为动作意图（"将幕布大纲导入 Obsidian"、"把 Markdown 同步到幕布"、"幕布笔记导出"），并**统一两处表述**，保留核心触发词（幕布/mubu），降低 ClawHub 扫描偶发激活风险。
+- **dependabot 治理**：`.github/dependabot.yml` 的 pip 生态设 `open-pull-requests-limit: 0`，**阻止 dependabot 直接改 `requirements.txt`/`requirements-dev.txt` 锁文件**（会丢失哈希、与 pip-tools 范式冲突，2026-07-28 曾开 PR 改锁文件）；保留 `github-actions` 生态不变。
+- **purge_item 安全修复（必做）**：原实现在回收站记录缺失时**默认按 folder 硬删**，可能把 doc 当 folder 误删（`/list/delete_folder` 端点与文档 id 不匹配）。改为：优先从回收站记录读 `item_type`；缺失时回退到调用方显式 `--type`，**二者皆无则抛出明确错误要求显式指定**，杜绝误删。CLI `purge` 新增可选 `--type doc|folder`（仅回收站记录缺失时必填）。零网络风险本地加固。
+- **move / save_doc / rename_doc 注释**：代码注释补"真机不可用/真机受限"（`illegal request` / 反爬签名），与 CHANGELOG 历史段一致，修正此前偏乐观的"可用"表述。
+
+## v1.3.7（本期发布版本 · 2026-08-04，仅本地提交，未发版）
+
+本期为文档/配置诚实度 + 触发词收敛 + dependabot 治理 + purge 安全加固（GitHub tag **待发版**，本次未 push/tag/release）。详见上方 M17。
+
+- fix: `purge_item` 回收站记录缺失时不再默认 folder，缺失且未显式 `--type` 则报错，杜绝 doc 误删（CLI `purge` 新增可选 `--type`）
+- docs: Roadmap ✅ 同步、README 写回类操作真机限制标注、触发词收敛（SKILL.md + README 统一）、dependabot 治理
+- test: 新增 `test_purge_without_trash_requires_type` / `test_purge_explicit_type_doc`（锁定 purge 安全行为）
+- 依赖/破坏性：无破坏性变更（purge CLI 新增可选 `--type`，向后兼容；其余均为文档/配置）
 
