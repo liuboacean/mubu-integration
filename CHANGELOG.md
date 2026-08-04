@@ -263,3 +263,26 @@ ClawHub SkillSpector 复审（GO；1 项 High 降为 Medium）3 项真实发现�
 - test: 102 passed（0 失败，无用例增减，纯文档修正）
 - 依赖/破坏性：无业务代码改动，纯文档一致性
 
+## M19 (v1.3.9) — move/save 真实端点重构（2026-08-04，发布）
+
+本期为两个真机 `code:17 / illegal request` 写回类端点的真实端点重构，使 `move` 与 `save_doc`/`rename_doc` 在真机恢复可用（此前被服务端反爬签名拒绝）。
+
+- **fix(move): 真实移动端点**：`move` 由错误的 `/list/move` 改为真实抓包的 `/list/custom/drag`（旧端点真机返回 `code:17`）；对齐浏览器级请求头 `x-session-id = uuid:epoch`、`x-reg-entrance = https://mubu.com/app`，与幕布 Web 客户端一致，消除反爬签名拒绝。
+- **fix(save): 真实保存端点**：`save_doc` 由错误的 `/doc/save` 改为真实抓包的 `/v3/api/colla/events`（旧端点真机返回 `code:17`）；新增 `build_update_event`，构造根节点 update 事件 `{name:"update", updated:[{updated:root, original:root}]}`，其中 `root = {id:doc_id, children:nodes, modified:ts}`。
+- **fix(save): 每文档 `x-reg-entrance`**：保存请求头 `x-reg-entrance` 改为每文档 `https://mubu.com/app/edit/home/<doc_id>`（取代统一的 app 首页入口）。
+- **fix(save): `member_id` 来源**：`member_id` 改由环境变量 `MUBU_MEMBER_ID`（位于 `~/.workbuddy/.env.mubu`）读取，token 缓存中缺失时回退到缓存值；不再依赖不可达的发现接口。
+- **fix(rename): 独立重命名端点**：`rename_doc` 改用独立的 `/list/rename_doc` 端点（此前与保存共用错误端点）。
+- **⚠️ KNOWN LIMITATION（save_doc 前置条件）**：个人文档的 `memberId` 无法通过任何 API 发现，因此 `save_doc` 要求 `~/.workbuddy/.env.mubu` 中设置 `MUBU_MEMBER_ID`（或 token 缓存中已有 `member_id`）；二者皆缺时保存会失败。
+- test: **112 passed（0 失败，较 v1.3.8 的 109 新增 3 例，无回归）**。
+
+## v1.3.9（本期发布版本 · 2026-08-04）
+
+本期为 move/save 真实端点重构（GitHub tag v1.3.9）。详见上方 M19。
+
+- fix(move): `move` 改用真实端点 `/list/custom/drag`（原为 `/list/move`，真机 `code:17`）；对齐浏览器级 `x-session-id`(uuid:epoch) / `x-reg-entrance`(https://mubu.com/app) 请求头
+- fix(save): `save_doc` 改用真实端点 `/v3/api/colla/events`（原为 `/doc/save`，`code:17`）；新增 `build_update_event`（根节点 update 事件，root=`{id, children, modified}`）
+- fix(save): 每文档 `x-reg-entrance = https://mubu.com/app/edit/home/<doc_id>`；`member_id` 由 `MUBU_MEMBER_ID` 环境变量（`~/.workbuddy/.env.mubu`）+ token 缓存回退读取
+- fix(rename): `rename_doc` 改用独立端点 `/list/rename_doc`
+- ⚠️ 已知限制：`memberId` 无法经 API 发现，个人文档 `save_doc` 需设置 `MUBU_MEMBER_ID`（或缓存 `member_id`），否则保存失败
+- test: 112 passed（0 失败，较 109 新增 3 例，无回归）
+
