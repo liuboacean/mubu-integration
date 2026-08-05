@@ -27,6 +27,7 @@
 - [测试与 CI](#测试与-ci)
 - [常见问题 FAQ](#常见问题-faq)
 - [注意事项](#注意事项)
+- [🤝 贡献](#贡献)
 - [License](#license)
 
 ## 项目结构（模块化）
@@ -337,6 +338,20 @@ A：当前不支持。大纲折叠状态 `expand`、有序列表 `1.`、图片 /
 - ⚠️ **`save` 需 colla 成员 ID**：私人文档的 `memberId` 任何 API 都不暴露（login / JWT / `/user/info` 均不含），`save_doc` 依赖 `MUBU_MEMBER_ID` 环境变量，或登录后写入 `~/.mubu_token` 缓存的 `member_id`。缺失时会明确报错，请按配置章节设置。
 
 > 说明：v1.3.5 已包含 M1–M9 及 P2 全部能力，并新增软删除 / 本地回收站（`delete`→软删除、`restore` 恢复、`purge` 彻底删除、`trash` 列表），以上为功能边界而非未完成项。
+
+## 🤝 贡献
+
+欢迎各种形式的参与 —— 无论是提 Bug、给建议，还是直接发 PR，都十分期待！
+
+- 🐛 **遇到问题？** 请在 [GitHub Issues](https://github.com/liuboacean/mubu-integration/issues) 里描述复现步骤（含命令输出与报错），方便快速定位。
+- 💡 **有想法 / 建议？** 同样开一个 Issue，标签选 `enhancement`，说说你希望支持的能力或改进点。
+- 🔧 **想直接改代码？** 欢迎 Fork 后提交 Pull Request：
+  1. Fork 本仓库并切到新分支（`git checkout -b fix/xxx` 或 `feat/xxx`）；
+  2. 本地跑通测试：`PYTHONPATH=scripts python -m pytest -v`（需 **112 passed**）；
+  3. 提交 PR 到 `main`，GitHub Actions 会在 Python 3.9–3.12 矩阵上自动验证；
+  4. 说明清楚改动动机与验证结果，便于评审合并。
+
+> 这是一个基于幕布 Web API 逆向实现的非官方 Skill，接口细节可能随幕布版本变化。如果你逆向到了新的端点或踩到了新的返回码，尤其欢迎开 Issue / PR 同步，帮大家少走弯路。
 
 ## License
 

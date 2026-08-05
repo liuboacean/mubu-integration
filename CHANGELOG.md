@@ -301,5 +301,17 @@ ClawHub SkillSpector 复审（GO；1 项 High 降为 Medium）3 项真实发现�
 - doc: 移除 SKILL.md / README.md 中遗留的「save/move/rename 真机不可用」错误声明（与已发布 M19 矛盾）
 - doc: 补充 `MUBU_MEMBER_ID` 配置说明（`save` 写回前置条件）
 - doc: README 测试计数 100 → 112
+
+## M21 (v1.3.11) — 文档补充贡献指引（2026-08-05，发布）
+
+纯文档同步，无代码/行为变更。在 README 新增「🤝 贡献」章节，欢迎社区提 Bug、建议与 PR。
+
+- **doc(README.md): 新增 `## 🤝 贡献` 章节**：引导用户通过 GitHub Issues 提 Bug / 建议（含 enhancement 标签说明），并给出 Fork → 跑通 112 passed → 向 `main` 提 PR 的流程；点明本 Skill 为非官方逆向项目，欢迎同步新端点 / 新返回码。同步在文档目录加入 `#贡献` 锚点。
+
+## v1.3.11（本期发布版本 · 2026-08-05）
+
+本期为文档补充（GitHub tag v1.3.11）。详见上方 M21。
+
+- doc: README 新增贡献指引（Issues / PR 流程）
 - 无代码/行为变更
 
