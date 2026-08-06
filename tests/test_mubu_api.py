@@ -423,7 +423,9 @@ class TestSaveTokenAtomic:
 
     def test_uses_os_rename(self, tmp_path):
         tok = tmp_path / "tok.json"
-        with mock.patch.object(mubu.client, "TOKEN_FILE", tok):
+        # 隔离 ENV_FILE，避免读取用户真实 ~/.workbuddy/.env.mubu（其 chmod 会污染 os.chmod mock）
+        with mock.patch.object(mubu.client, "ENV_FILE", tmp_path / "no_env.mubu"), \
+                mock.patch.object(mubu.client, "TOKEN_FILE", tok):
             with mock.patch("os.rename") as mren, \
                     mock.patch("os.chmod") as mchmod:
                 c = MubuClient(phone="p", password="w")
@@ -464,7 +466,14 @@ class TestCliParsing:
     def test_cli_move_parses(self, monkeypatch):
         err, MC, _ = self._run(["move", "item1", "--target", "fid"], monkeypatch)
         assert err is None
-        MC.return_value.move.assert_called_once_with("item1", "fid")
+        MC.return_value.move.assert_called_once_with("item1", "fid", "doc")
+
+    def test_cli_move_folder_type_parses(self, monkeypatch):
+        # --type folder 应透传给 client.move 的 item_type 参数
+        err, MC, _ = self._run(
+            ["move", "fld1", "--target", "fid", "--type", "folder"], monkeypatch)
+        assert err is None
+        MC.return_value.move.assert_called_once_with("fld1", "fid", "folder")
 
     def test_cli_get_export_markdown_parses(self, monkeypatch):
         err, MC, _ = self._run(["get", "doc123", "--export", "markdown"], monkeypatch)
@@ -687,6 +696,22 @@ class TestEnvFileLoading:
         c._load_env_file(path=env)
         assert os.getenv("MUBU_PHONE") == "13800000000"
 
+    def test_member_id_loaded_from_env_file(self, tmp_path, monkeypatch):
+        """v1.3.9：MUBU_MEMBER_ID 纳入 .env 允许列表，未设环境变量时补全。"""
+        monkeypatch.setattr(mubu_api.os, "environ", {})
+        tok = tmp_path / "tok.json"
+        monkeypatch.setattr(mubu.client, "TOKEN_FILE", tok)
+        envf = tmp_path / ".env.mubu"
+        envf.write_text(
+            "MUBU_PHONE=x\nMUBU_PASSWORD=y\nMUBU_MEMBER_ID=3830260985345232\n",
+            encoding="utf-8",
+        )
+        with mock.patch.object(mubu.client, "ENV_FILE", envf):
+            c = MubuClient()
+        assert c.member_id == "3830260985345232"
+        # 变量已被补全进环境（便于 build_update_event / save_doc 取用）
+        assert os.getenv("MUBU_MEMBER_ID") == "3830260985345232"
+
 
 # --------------------------------------------------------------------------- #
 # 11. M2 T5 — Token 文件权限 600（_save_token 原子写后 chmod）
@@ -856,24 +881,56 @@ class TestApiMethodPayloads:
 
     @responses.activate
     def test_get_doc_body_and_return(self, isolated_client):
+        # 修复后：端点 /document/edit/get，body {docId, password, isFromDocDir}
+        # 返回 data.definition（JSON 字符串）→ 二次解析为 nodes
+        definition = json.dumps({
+            "nodes": [
+                {"id": "n1", "text": "一级", "children": [],
+                 "collapsed": False, "finish": False},
+            ]
+        })
         responses.add(
-            responses.POST, f"{BASE_URL}/doc/get",
-            json={"code": 0, "data": {"node": {"text": "t"}}}, status=200,
-            match=[matchers.json_params_matcher({"id": "D9"})],
+            responses.POST, f"{BASE_URL}/document/edit/get",
+            json={"code": 0, "data": {"name": "文档标题", "definition": definition}},
+            status=200,
+            match=[matchers.json_params_matcher(
+                {"docId": "D9", "password": "", "isFromDocDir": True})],
         )
-        assert isolated_client.get_doc("D9") == {"node": {"text": "t"}}
+        assert isolated_client.get_doc("D9") == {
+            "name": "文档标题",
+            "nodes": [{"id": "n1", "text": "一级", "children": [],
+                       "collapsed": False, "finish": False}],
+        }
 
     @responses.activate
-    def test_save_doc_body_with_name(self, isolated_client):
+    def test_save_doc_body_with_events_and_name(self, isolated_client):
         captured = {}
 
         def cb(request):
             captured["body"] = json.loads(request.body)
+            captured["headers"] = dict(request.headers)
             return (200, {}, json.dumps({"code": 0, "data": {}}))
 
-        responses.add_callback(responses.POST, f"{BASE_URL}/doc/save", callback=cb)
-        isolated_client.save_doc("D9", "content-here", name="Renamed")
-        assert captured["body"] == {"id": "D9", "content": "content-here", "name": "Renamed"}
+        responses.add_callback(responses.POST, f"{BASE_URL}/colla/events", callback=cb)
+        event = isolated_client.build_update_event(
+            {"nodes": [{"id": "n1", "text": "A"}]}, "D9")
+        isolated_client.member_id = "M1"
+        # name 走独立 rename_doc 端点（不塞进 colla/events 的 nameChanged 事件）
+        with mock.patch.object(isolated_client, "rename_doc") as mrename:
+            isolated_client.save_doc("D9", events=[event], version=3, name="Renamed")
+        # 内容保存：colla/events，events 不含 nameChanged
+        assert captured["body"] == {
+            "memberId": "M1",
+            "type": "CHANGE",
+            "version": 3,
+            "documentId": "D9",
+            "events": [event],
+        }
+        assert "name" not in captured["body"]
+        # 改名被分派到独立端点
+        mrename.assert_called_once_with("D9", "Renamed")
+        # 每文档独立的 x-reg-entrance（覆盖 _get_headers 的固定值）
+        assert captured["headers"]["x-reg-entrance"] == "https://mubu.com/app/edit/home/D9"
 
     @responses.activate
     def test_save_doc_body_without_name(self, isolated_client):
@@ -881,12 +938,67 @@ class TestApiMethodPayloads:
 
         def cb(request):
             captured["body"] = json.loads(request.body)
+            captured["headers"] = dict(request.headers)
             return (200, {}, json.dumps({"code": 0, "data": {}}))
 
-        responses.add_callback(responses.POST, f"{BASE_URL}/doc/save", callback=cb)
-        isolated_client.save_doc("D9", "x")
-        assert captured["body"] == {"id": "D9", "content": "x"}
+        responses.add_callback(responses.POST, f"{BASE_URL}/colla/events", callback=cb)
+        event = isolated_client.build_update_event(
+            {"nodes": [{"id": "n1", "text": "A"}]}, "D9")
+        isolated_client.member_id = "M1"
+        isolated_client.save_doc("D9", events=[event], version=3)
+        assert captured["body"] == {
+            "memberId": "M1",
+            "type": "CHANGE",
+            "version": 3,
+            "documentId": "D9",
+            "events": [event],
+        }
         assert "name" not in captured["body"]
+        assert captured["headers"]["x-reg-entrance"] == "https://mubu.com/app/edit/home/D9"
+
+    @responses.activate
+    def test_save_doc_auto_fetches_version_and_definition(self, isolated_client):
+        """save_doc 不传 events/version 时，自动拉取 baseVersion 与当前 definition，
+        构造幂等全量回写（touch）。"""
+        captured = {}
+        definition = json.dumps({"nodes": [{"id": "n1", "text": "A"}]})
+        responses.add(
+            responses.POST, f"{BASE_URL}/document/edit/get",
+            json={"code": 0, "data": {"name": "T", "baseVersion": 7, "definition": definition}},
+            status=200,
+            match=[matchers.json_params_matcher(
+                {"docId": "D9", "password": "", "isFromDocDir": True})],
+        )
+
+        def cb(request):
+            captured["body"] = json.loads(request.body)
+            return (200, {}, json.dumps({"code": 0, "data": {}}))
+
+        responses.add_callback(responses.POST, f"{BASE_URL}/colla/events", callback=cb)
+        isolated_client.member_id = "M1"
+        isolated_client.save_doc("D9")
+        assert captured["body"]["version"] == 7
+        assert captured["body"]["documentId"] == "D9"
+        update_event = captured["body"]["events"][0]
+        assert update_event["name"] == "update"
+        root = update_event["updated"][0]["updated"]
+        assert root["id"] == "D9"
+        assert root["children"] == [{"id": "n1", "text": "A"}]
+        # 幂等：updated == original
+        assert update_event["updated"][0]["updated"] == update_event["updated"][0]["original"]
+
+    def test_build_update_event_shape(self, isolated_client):
+        """build_update_event 形状：单个 update 事件，root 节点 children = 顶层 nodes，
+        updated 与 original 同构（幂等写回）。"""
+        event = isolated_client.build_update_event(
+            {"nodes": [{"id": "n1", "text": "A", "children": []}]}, "D9")
+        assert event["name"] == "update"
+        pair = event["updated"][0]
+        assert pair["updated"]["id"] == "D9"
+        assert pair["updated"]["children"] == [{"id": "n1", "text": "A", "children": []}]
+        assert isinstance(pair["updated"]["modified"], int)
+        # 幂等：updated 与 original 完全一致
+        assert pair["updated"] == pair["original"]
 
     @responses.activate
     def test_delete_body(self, isolated_client):
@@ -906,11 +1018,13 @@ class TestApiMethodPayloads:
 
         def cb(request):
             captured["body"] = json.loads(request.body)
+            captured["path"] = request.path_url
             return (200, {}, json.dumps({"code": 0, "data": {}}))
 
-        responses.add_callback(responses.POST, f"{BASE_URL}/list/move", callback=cb)
-        isolated_client.move("D9", "F2")
-        assert captured["body"] == {"id": "D9", "folderId": "F2"}
+        responses.add_callback(responses.POST, f"{BASE_URL}/list/custom/drag", callback=cb)
+        isolated_client.move("D9", "F2", item_type="doc")
+        assert captured["body"] == {"dst": None, "src": [{"type": "doc", "id": "D9"}], "folderId": "F2"}
+        assert "/list/custom/drag" in captured["path"]
 
 
 # --------------------------------------------------------------------------- #
@@ -929,6 +1043,8 @@ class TestDeleteGuard:
     def _invoke(self, argv, monkeypatch, tmp_path):
         monkeypatch.setattr(sys, "argv", ["mubu_api.py"] + argv)
         monkeypatch.setattr(mubu.client, "TOKEN_FILE", self._write_token(tmp_path))
+        # v1.3.5：软删除回收站写入 TRASH_FILE，测试必须隔离到 tmp 路径
+        monkeypatch.setattr(mubu.client, "TRASH_FILE", tmp_path / "trash.json")
         err = None
         try:
             mubu_api.main()
@@ -944,16 +1060,156 @@ class TestDeleteGuard:
         err = self._invoke(["delete", "id1"], monkeypatch, tmp_path)
         assert err is not None and err.code == 1
         assert len(responses.calls) == 0
-        assert "不可逆" in capsys.readouterr().err
+        # v1.3.5：delete 改为软删除，警示文案改为「回收站」相关
+        assert "回收站" in capsys.readouterr().err
 
     @responses.activate
-    def test_delete_with_yes_calls_api(self, monkeypatch, tmp_path):
+    def test_delete_with_yes_marks_trash(self, monkeypatch, tmp_path):
+        # v1.3.5：软删除——即便注册了 delete_folder mock，--yes 也只写回收站、
+        # 绝不调用服务端（0 次网络请求），且 TRASH_FILE 出现 id1 键。
         responses.add(responses.POST, f"{BASE_URL}/list/delete_folder",
                       json={"code": 0, "data": {}}, status=200)
         err = self._invoke(["delete", "id1", "--yes"], monkeypatch, tmp_path)
         assert err is None
+        assert len(responses.calls) == 0
+        trash = json.loads((tmp_path / "trash.json").read_text())
+        assert "id1" in trash
+
+
+class TestTrash:
+    """v1.3.5 软删除 / 本地回收站：restore / purge / list&search 过滤。"""
+
+    def _write_token(self, tmp_path):
+        tok = tmp_path / "tok.json"
+        tok.write_text(json.dumps({
+            "token": "t", "user_id": "u", "username": "n",
+            "expires_at": time.time() + 3600,
+        }))
+        return tok
+
+    def _invoke(self, argv, monkeypatch, tmp_path):
+        monkeypatch.setattr(sys, "argv", ["mubu_api.py"] + argv)
+        monkeypatch.setattr(mubu.client, "TOKEN_FILE", self._write_token(tmp_path))
+        # 软删除回收站写入 TRASH_FILE，必须隔离到 tmp 路径
+        monkeypatch.setattr(mubu.client, "TRASH_FILE", tmp_path / "trash.json")
+        err = None
+        try:
+            mubu_api.main()
+        except SystemExit as e:
+            err = e
+        return err
+
+    @responses.activate
+    def test_restore_removes_trash(self, monkeypatch, tmp_path):
+        # 预写回收站快照，restore 应移除 id1 标记（零服务端调用）
+        trash = tmp_path / "trash.json"
+        trash.write_text(json.dumps({"id1": {
+            "id": "id1", "type": "doc", "name": "x", "parent_id": "0",
+            "deleted_at": "2026-01-01T00:00:00",
+        }}))
+        err = self._invoke(["restore", "id1"], monkeypatch, tmp_path)
+        assert err is None
+        data = json.loads(trash.read_text())
+        assert "id1" not in data
+
+    @responses.activate
+    def test_purge_requires_yes_and_calls_api(self, monkeypatch, tmp_path):
+        # 预写回收站快照（folder 类型）
+        trash = tmp_path / "trash.json"
+        trash.write_text(json.dumps({"id1": {
+            "id": "id1", "type": "folder", "name": "x", "parent_id": "0",
+            "deleted_at": "2026-01-01T00:00:00",
+        }}))
+        responses.add(responses.POST, f"{BASE_URL}/list/delete_folder",
+                      json={"code": 0, "data": {}}, status=200)
+        # 无 --yes → 退出码 1，且 0 次网络请求（彻底删除被守卫拦下）
+        err = self._invoke(["purge", "id1"], monkeypatch, tmp_path)
+        assert err is not None and err.code == 1
+        assert len(responses.calls) == 0
+        # 有 --yes → 恰好 1 次服务端调用，且回收站 id1 被移除
+        err = self._invoke(["purge", "id1", "--yes"], monkeypatch, tmp_path)
+        assert err is None
         assert len(responses.calls) == 1
-        assert json.loads(responses.calls[0].request.body) == {"id": "id1"}
+        data = json.loads(trash.read_text())
+        assert "id1" not in data
+
+    @responses.activate
+    def test_list_filters_trashed(self, monkeypatch, tmp_path, isolated_client):
+        responses.add(
+            responses.POST, f"{BASE_URL}/list/get",
+            json={"code": 0, "data": {
+                "documents": [{"id": "trash1", "name": "x"},
+                              {"id": "ok1", "name": "y"}],
+                "folders": [],
+            }}, status=200,
+            match=[matchers.json_params_matcher({"folderId": "0"})],
+        )
+        # 预写回收站：trash1 为软删除项
+        trash = tmp_path / "trash.json"
+        trash.write_text(json.dumps({"trash1": {
+            "id": "trash1", "type": "doc", "name": "x", "parent_id": "0",
+            "deleted_at": "2026-01-01T00:00:00",
+        }}))
+        monkeypatch.setattr(mubu.client, "TRASH_FILE", trash)
+        # 默认过滤软删除项
+        data = isolated_client.get_list("0")
+        ids = {d.get("id") for d in (data.get("documents") or [])}
+        assert "trash1" not in ids
+        assert "ok1" in ids
+        # include_trashed=True 时保留
+        data2 = isolated_client.get_list("0", include_trashed=True)
+        ids2 = {d.get("id") for d in (data2.get("documents") or [])}
+        assert "trash1" in ids2
+        assert "ok1" in ids2
+
+    @responses.activate
+    def test_search_filters_trashed(self, monkeypatch, tmp_path, isolated_client):
+        responses.add(
+            responses.POST, f"{BASE_URL}/list/get",
+            json={"code": 0, "data": {
+                "folders": [{"id": "trash1", "name": "x"}],
+                "documents": [{"id": "ok1", "name": "x"}],
+            }}, status=200,
+            match=[matchers.json_params_matcher({"folderId": "0"})],
+        )
+        trash = tmp_path / "trash.json"
+        trash.write_text(json.dumps({"trash1": {
+            "id": "trash1", "type": "folder", "name": "x", "parent_id": "0",
+            "deleted_at": "2026-01-01T00:00:00",
+        }}))
+        monkeypatch.setattr(mubu.client, "TRASH_FILE", trash)
+        # 默认：软删除项被过滤
+        res = isolated_client.search("x")
+        ids = {r["id"] for r in res["results"]}
+        assert "trash1" not in ids
+        assert "ok1" in ids
+        # include_trashed=True：软删除项也纳入
+        res2 = isolated_client.search("x", include_trashed=True)
+        ids2 = {r["id"] for r in res2["results"]}
+        assert "trash1" in ids2
+        assert "ok1" in ids2
+
+    @responses.activate
+    def test_purge_without_trash_record_requires_type(self, monkeypatch, tmp_path, capsys):
+        # v1.3.7 安全修复：回收站记录缺失且未显式 --type 时，必须拒绝而非默认 folder
+        # 不预写回收站（_load_trash 返回 {}），不注册任何删除端点
+        err = self._invoke(["purge", "idX", "--yes"], monkeypatch, tmp_path)
+        assert err is not None and err.code == 1
+        # 0 次网络请求（绝不能误走到 delete_folder）
+        assert len(responses.calls) == 0
+        captured = capsys.readouterr()
+        assert "类型" in captured.err
+
+    @responses.activate
+    def test_purge_explicit_type_doc_calls_delete_doc(self, monkeypatch, tmp_path):
+        # v1.3.7：回收站缺失但显式 --type doc → 调用 /list/delete_doc
+        responses.add(responses.POST, f"{BASE_URL}/list/delete_doc",
+                      json={"code": 0, "data": {}}, status=200)
+        err = self._invoke(["purge", "idX", "--type", "doc", "--yes"],
+                            monkeypatch, tmp_path)
+        assert err is None
+        assert len(responses.calls) == 1
+        assert responses.calls[0].request.url.endswith("/list/delete_doc")
 
 
 # --------------------------------------------------------------------------- #
@@ -987,6 +1243,9 @@ class TestLoginCliNoPlaintextArgs:
     def test_login_prompts_getpass_when_env_missing(self, monkeypatch, tmp_path, capsys):
         monkeypatch.delenv("MUBU_PHONE", raising=False)
         monkeypatch.delenv("MUBU_PASSWORD", raising=False)
+        # 隔离 ENV_FILE，避免读取用户真实 ~/.workbuddy/.env.mubu 把 MUBU_PHONE/
+        # MUBU_PASSWORD 重新写回环境，覆盖本测试的 getpass 模拟输入
+        monkeypatch.setattr(mubu.client, "ENV_FILE", tmp_path / "no_env.mubu")
         responses.add(responses.POST, f"{BASE_URL}/user/phone_login",
                       json={"code": 0, "data": {"token": "T1", "id": "U1", "name": "alice"}},
                       status=200)
@@ -1257,8 +1516,10 @@ class TestRequirementsSplit:
         text = dev.read_text(encoding="utf-8")
         assert "pytest" in text
         assert "responses" in text
-        # responses 应带上限，避免意外大版本跃迁
-        assert "<1" in text
+        # v1.3.5：改为 pip-compile 全量锁定（精确版本 + 哈希），不再使用上限约束
+        assert "--hash" in text        # 供应链加固：哈希锁定
+        assert "pytest==" in text      # 精确锁定版本
+        assert "responses==" in text
 
     def test_runtime_requirements_has_only_requests(self):
         rt = REPO_ROOT / "requirements.txt"
@@ -1310,17 +1571,33 @@ class TestExportTree:
 
 
 class TestRename:
-    def test_rename_doc_calls_save_with_name(self):
+    def test_rename_doc_uses_list_rename_doc_endpoint(self):
+        """rename_doc 走独立端点 /list/rename_doc（真正的改名 API），
+        而非把 nameChanged 塞进 colla/events（后者仅用于协同同步，显式改名被拒）。"""
         client = MubuClient()
-        doc = {"node": {"text": "Old", "children": []}}
-        with mock.patch.object(client, "get_doc", return_value=doc) as mget, \
-             mock.patch.object(client, "save_doc") as msave:
+        with mock.patch.object(client, "_request") as mreq:
+            mreq.return_value = {"code": 0, "data": {}}
             client.rename_doc("d1", "New Name")
-        mget.assert_called_once_with("d1")
-        msave.assert_called_once()
-        args, kwargs = msave.call_args
-        assert "d1" in args
-        assert kwargs.get("name") == "New Name"
+        mreq.assert_called_once()
+        args, kwargs = mreq.call_args
+        assert args[0] == "POST"
+        assert args[1] == "/list/rename_doc"
+        # 注意字段是 documentId（不是 id；id 会返回 code 5）
+        assert kwargs["json"] == {"documentId": "d1", "name": "New Name"}
+
+    def test_rename_doc_sends_document_id_and_name(self):
+        client = MubuClient()
+        captured = {}
+
+        def fake_request(method, endpoint, **kwargs):
+            captured["endpoint"] = endpoint
+            captured["json"] = kwargs.get("json")
+            return {"code": 0, "data": {}}
+
+        with mock.patch.object(client, "_request", side_effect=fake_request):
+            client.rename_doc("abc123", "Renamed Title")
+        assert captured["endpoint"] == "/list/rename_doc"
+        assert captured["json"] == {"documentId": "abc123", "name": "Renamed Title"}
 
     def test_rename_folder_uses_update_endpoint(self):
         client = MubuClient()
@@ -1370,6 +1647,56 @@ class TestOpmlFreeplane:
         root = ET.fromstring(xml)
         assert root.tag == "map"
 
+    def _sample_nodes_doc(self):
+        # 真实 get_doc 返回形状：{"name":..., "nodes":[顶层节点...]}
+        return {
+            "name": "MyDoc",
+            "nodes": [
+                {
+                    "text": "Root",
+                    "children": [
+                        {"text": "A", "children": [{"text": "A1"}]},
+                        {"text": "B", "note": "hello"},
+                    ],
+                },
+            ],
+        }
+
+    def test_doc_to_opml_nodes_shape(self):
+        import xml.etree.ElementTree as ET
+
+        # 回归真实 API 形状 {"nodes":[...]} 的渲染（双形状优先分支）
+        xml = doc_to_opml(self._sample_nodes_doc())
+        assert xml.startswith("<?xml")
+        root = ET.fromstring(xml)
+        assert root.tag == "opml"
+        body = root.find("body")
+        assert body is not None
+        top_outlines = list(body)
+        # 每个顶层 node 成为 <body> 下的一个 <outline>
+        assert len(top_outlines) == 1
+        assert top_outlines[0].get("text") == "Root"
+        outlines = [e for e in root.iter("outline")]
+        # Root + A + A1 + B = 4 个 outline，且 note 保留
+        assert len(outlines) == 4
+        assert any(o.get("_note") == "hello" for o in outlines)
+
+    def test_doc_to_freeplane_nodes_shape(self):
+        import xml.etree.ElementTree as ET
+
+        # 回归真实 API 形状 {"nodes":[...]} 的渲染：nodes[0] 作为根 <node>
+        xml = doc_to_freeplane(self._sample_nodes_doc())
+        assert xml.startswith("<?xml")
+        root = ET.fromstring(xml)
+        assert root.tag == "map"
+        root_node = root.find("node")
+        assert root_node is not None
+        assert root_node.get("text") == "Root"
+        children = list(root_node)
+        # nodes[0].children = [A, B] 成为根 node 的直接子节点
+        assert len(children) == 2
+        assert {c.get("text") for c in children} == {"A", "B"}
+
 
 class TestSafeFilename:
     def test_illegal_chars_replaced(self):
@@ -1386,6 +1713,76 @@ class TestSafeFilename:
         from mubu_api import _safe_filename
 
         assert _safe_filename("我的文档 v1") == "我的文档 v1"
+
+
+# --------------------------------------------------------------------------- #
+# 27. 排障手 move-sign 第 1 步 — 浏览器同款 x-头（离线验证，mock 网络）
+#     断言 _get_headers() 与一次被 mock 的请求都携带 4 个浏览器同款头，且
+#     Jwt-Token 在持有 token 时仍在、无 token 时缺省；x-request-id 每次请求不同，
+#     data-unique-id / x-session-id 在实例生命周期内稳定。
+# --------------------------------------------------------------------------- #
+class TestBrowserParityHeaders:
+    def _client_with_token(self, tmp_path):
+        tok = tmp_path / "tok.json"
+        with mock.patch.object(mubu.client, "TOKEN_FILE", tok):
+            c = MubuClient(phone="p", password="w")
+            c.token = "valid-token"
+            c.expires_at = time.time() + 3600
+            return c
+
+    def test_get_headers_has_four_browser_headers(self, tmp_path):
+        c = self._client_with_token(tmp_path)
+        h = c._get_headers()
+        assert h["data-unique-id"] == c._client_unique_id
+        # x-session-id 形如 {uuid}:{epoch秒}，前缀稳定
+        assert h["x-session-id"].split(":", 1)[0] == c._session_id
+        assert h["x-session-id"].split(":", 1)[1].isdigit()
+        assert h["x-reg-entrance"] == "https://mubu.com/app"
+        # x-request-id 是合法 uuid4
+        import uuid as _uuid
+        assert _uuid.UUID(h["x-request-id"]).version == 4
+
+    def test_request_id_differs_per_call(self, tmp_path):
+        c = self._client_with_token(tmp_path)
+        assert c._get_headers()["x-request-id"] != c._get_headers()["x-request-id"]
+
+    def test_unique_id_and_session_stable_per_instance(self, tmp_path):
+        c = self._client_with_token(tmp_path)
+        h1, h2 = c._get_headers(), c._get_headers()
+        # data-unique-id 跨调用不变
+        assert h1["data-unique-id"] == h2["data-unique-id"] == c._client_unique_id
+        # x-session-id 前缀（uuid）稳定，整体形如 uuid:数字
+        assert h1["x-session-id"].split(":", 1)[0] == c._session_id
+        assert h2["x-session-id"].split(":", 1)[0] == c._session_id
+        assert h1["x-session-id"].split(":", 1)[1].isdigit()
+        assert h2["x-session-id"].split(":", 1)[1].isdigit()
+        # 但 x-request-id 每次都应不同
+        assert h1["x-request-id"] != h2["x-request-id"]
+
+    def test_jwt_token_present_when_token_set(self, tmp_path):
+        c = self._client_with_token(tmp_path)
+        assert c._get_headers()["Jwt-Token"] == "valid-token"
+
+    def test_jwt_token_absent_when_no_token(self):
+        c = MubuClient(phone="p", password="w")
+        c.token = None
+        assert "Jwt-Token" not in c._get_headers()
+
+    @mock.patch("requests.Session.request")
+    def test_outgoing_request_carries_all_headers(self, mreq, tmp_path):
+        """端到端：一次被 mock 的真实请求，其出站头应含 4 个浏览器同款头 + Jwt-Token。"""
+        c = self._client_with_token(tmp_path)
+        resp = mock.Mock()
+        resp.status_code = 200
+        resp.json.return_value = {"code": 0, "data": {"folders": [], "docs": []}}
+        mreq.return_value = resp
+        c.get_list("0")
+        assert mreq.call_count == 1
+        sent_headers = mreq.call_args.kwargs.get("headers") or mreq.call_args.args[2]
+        for key in ("data-unique-id", "x-session-id", "x-reg-entrance", "x-request-id"):
+            assert key in sent_headers, f"缺失浏览器同款头: {key}"
+        assert sent_headers["x-reg-entrance"] == "https://mubu.com/app"
+        assert sent_headers["Jwt-Token"] == "valid-token"
 
 
 # --------------------------------------------------------------------------- #

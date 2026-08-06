@@ -33,9 +33,9 @@ def doc_to_markdown(node: Dict[str, Any], level: int = 0) -> str:
     text = (node.get("text") or "").replace("\n", " ")
     indent = " " * (2 * level)
 
-    # 勾选状态（mark 为单个字符 x / 空格）
-    if node.get("checked") is not None:
-        mark = "x" if node.get("checked") else " "
+    # 勾选状态：兼容旧版 checked 与真实 API 的 finish（布尔）
+    if node.get("checked") is not None or node.get("finish") is not None:
+        mark = "x" if (node.get("checked") or node.get("finish")) else " "
         lines.append(f"{indent}- [{mark}] {text}")
     else:
         lines.append(f"{indent}- {text}")
@@ -53,10 +53,15 @@ def doc_to_markdown(node: Dict[str, Any], level: int = 0) -> str:
 
 
 def export_markdown(doc: Dict[str, Any]) -> str:
-    """将文档 data 层转换为 Markdown 文本。
+    """将文档结构转换为 Markdown 文本。
+
+    兼容两种输入形状（get_doc 修复后引入真实 API 形状，需向后兼容旧往返形状）：
+    - 真实 API（get_doc 修复后返回）：{"name":..., "nodes":[顶层节点...]}
+      mubu 文档通常只有一个顶层节点，其 text 即文档标题，children 为大纲正文。
+    - 本地往返（markdown_to_doc 返回）：{"node":{...}} 或裸 {"text":..., "children":[...]}
 
     Args:
-        doc: get_doc() 返回的 data 层，结构 {"node": {"text":..., "children":[...]}}
+        doc: 文档结构（见上两种形状）
 
     Returns:
         Markdown 文本（首行为 '# 标题'）
@@ -64,6 +69,21 @@ def export_markdown(doc: Dict[str, Any]) -> str:
     Raises:
         MubuError: 文档结构无效（既无有效 text 也无 children）时
     """
+    # 新形状：真实 API 的 nodes 顶层数组（优先）
+    nodes = doc.get("nodes")
+    if nodes:
+        lines: List[str] = []
+        for node in nodes:
+            title = (node.get("text") or "").replace("\n", " ")
+            lines.append(f"# {title}")
+            for child in node.get("children") or []:
+                lines.append(doc_to_markdown(child, level=0))
+            note = node.get("note")
+            if note:
+                lines.append(f"> {note}")
+        return "\n".join(lines)
+
+    # 旧形状：markdown_to_doc 的单一 node（或裸 node）
     root = doc.get("node") or doc
     if not isinstance(root, dict) or (not root.get("text") and not root.get("children")):
         raise MubuError("无效的文档结构")
@@ -87,16 +107,14 @@ def _safe_filename(name: str) -> str:
 
 
 def doc_to_opml(doc: Dict[str, Any]) -> str:
-    """将幕布文档转为 OPML 2.0 XML（兼容 FreeMind / XMind 等大纲工具导入）。"""
+    """将幕布文档转为 OPML 2.0 XML（兼容 FreeMind / XMind 等大纲工具导入）。
+
+    兼容两种输入形状（与 export_markdown 一致的双形状设计）：
+    - 真实 API（get_doc 返回）：{"name":..., "nodes":[顶层节点...]}
+      每个顶层 node 成为 <body> 下的一个 <outline>。
+    - 本地往返（markdown_to_doc 返回）：{"node":{...}} 或裸 {"text":..., "children":[...]}
+    """
     import xml.etree.ElementTree as ET
-
-    root = doc.get("node") or doc
-    title = (root.get("text") or "mubu-export").replace("\\n", " ")
-
-    opml = ET.Element("opml", version="2.0")
-    head = ET.SubElement(opml, "head")
-    ET.SubElement(head, "title").text = title
-    body = ET.SubElement(opml, "body")
 
     def build(node: Dict[str, Any], parent: ET.Element) -> None:
         text = (node.get("text") or "").replace("\\n", " ")
@@ -107,20 +125,39 @@ def doc_to_opml(doc: Dict[str, Any]) -> str:
         for child in node.get("children") or []:
             build(child, outline)
 
-    build(root, body)
+    opml = ET.Element("opml", version="2.0")
+    head = ET.SubElement(opml, "head")
+
+    nodes = doc.get("nodes")
+    if nodes:
+        # 真实 API 形状：每个顶层 node 成为 <body> 下的一个 <outline>
+        title = (nodes[0].get("text") or doc.get("name") or "mubu-export").replace("\\n", " ")
+        ET.SubElement(head, "title").text = title
+        body = ET.SubElement(opml, "body")
+        for node in nodes:
+            build(node, body)
+    else:
+        # 向后兼容：markdown_to_doc 形状的单一 node（或裸 node）
+        root = doc.get("node") or doc
+        title = (root.get("text") or "mubu-export").replace("\\n", " ")
+        ET.SubElement(head, "title").text = title
+        body = ET.SubElement(opml, "body")
+        build(root, body)
+
     ET.indent(opml, space="  ")
     return ET.tostring(opml, encoding="utf-8", xml_declaration=True).decode("utf-8")
 
 
 def doc_to_freeplane(doc: Dict[str, Any]) -> str:
-    """将幕布文档转为 FreeMind (Freeplane) XML。"""
+    """将幕布文档转为 FreeMind (Freeplane) XML。
+
+    兼容两种输入形状（与 export_markdown 一致的双形状设计）：
+    - 真实 API（get_doc 返回）：{"name":..., "nodes":[顶层节点...]}
+      用第一个顶层 node 作为根 <node>（title=其 text），对其 children 递归 build；
+      其余顶层 node 作为根 node 的 children 追加（保证不丢内容）。
+    - 本地往返（markdown_to_doc 返回）：{"node":{...}} 或裸 {"text":..., "children":[...]}
+    """
     import xml.etree.ElementTree as ET
-
-    root = doc.get("node") or doc
-    title = (root.get("text") or "mubu-export").replace("\\n", " ")
-
-    mindmap = ET.Element("map", version="1.0.1")
-    root_node = ET.SubElement(mindmap, "node", text=title)
 
     def build(node: Dict[str, Any], parent: ET.Element) -> None:
         for child in node.get("children") or []:
@@ -132,7 +169,29 @@ def doc_to_freeplane(doc: Dict[str, Any]) -> str:
                 ET.SubElement(note_el, "html").text = note
             build(child, node_el)
 
-    build(root, root_node)
+    mindmap = ET.Element("map", version="1.0.1")
+
+    nodes = doc.get("nodes")
+    if nodes:
+        # 真实 API 形状：用第一个顶层 node 作为根 <node>
+        title = (nodes[0].get("text") or doc.get("name") or "mubu-export").replace("\\n", " ")
+        root_node = ET.SubElement(mindmap, "node", text=title)
+        build(nodes[0], root_node)
+        # 其余顶层 node 作为根 node 的 children 追加（不丢内容）
+        for extra in nodes[1:]:
+            text = (extra.get("text") or "mubu-export").replace("\\n", " ")
+            extra_el = ET.SubElement(root_node, "node", text=text)
+            note = extra.get("note")
+            if note:
+                note_el = ET.SubElement(extra_el, "richcontent", type="note")
+                ET.SubElement(note_el, "html").text = note
+            build(extra, extra_el)
+    else:
+        root = doc.get("node") or doc
+        title = (root.get("text") or "mubu-export").replace("\\n", " ")
+        root_node = ET.SubElement(mindmap, "node", text=title)
+        build(root, root_node)
+
     ET.indent(mindmap, space="  ")
     return ET.tostring(mindmap, encoding="utf-8", xml_declaration=True).decode("utf-8")
 

@@ -60,6 +60,12 @@ def _resolve_base_url() -> str:
 BASE_URL = _resolve_base_url()
 TOKEN_FILE = Path.home() / ".mubu_token"
 
+# 本地回收站（软删除）快照文件：仅记录元数据（id / type / name / parent_id /
+# deleted_at），作为「云端仍在、可恢复」的安全网；永不作为重建来源。
+# 软删除（delete）→ 仅写入此文件、零服务端调用；restore → 仅移除标记；
+# purge → 调用真实删除 API 后移除标记（唯一不可逆操作）。
+TRASH_FILE = Path.home() / ".workbuddy" / ".mubu_trash.json"
+
 # .env 凭据文件路径：仅当环境变量未设置时用于补全 MUBU_PHONE / MUBU_PASSWORD
 ENV_FILE = Path.home() / ".workbuddy" / ".env.mubu"
 
@@ -78,14 +84,22 @@ ENDPOINTS = {
     "list": ("POST", "/list/get"),
     "create_folder": ("POST", "/list/create_folder"),
     "create_doc": ("POST", "/list/create_doc"),
-    "get_doc": ("POST", "/doc/get"),
-    "save_doc": ("POST", "/doc/save"),
+    "get_doc": ("POST", "/document/edit/get"),
+    # v1.3.9（2026-08-04）：save_doc 从已废弃的 /doc/save（服务端签名校验
+    # 一律返回 code:17 illegal request）切换至网页端真实写接口 /v3/api/colla/events。
+    # 端点形态与请求体逆向自网页端 DocEditor chunk（抓包复核）。
+    "save_doc": ("POST", "/colla/events"),
+    # v1.3.9（2026-08-04）：文档重命名走独立端点 /list/rename_doc（与 /list/rename_folder
+    # 同族）。注意：不可把 nameChanged 事件塞进 colla/events —— 该事件仅用于协同实时
+    # 同步，显式重命名会被服务端拒绝 illegal request（已真机验证）。
+    "rename_doc": ("POST", "/list/rename_doc"),
     # 真机验证（2026-07-15）：删除必须区分类型，且端点为 delete_folder / delete_doc，
     # 原推测的 /list/delete 实测返回 code 17 illegal request。
     "delete_folder": ("POST", "/list/delete_folder"),
     "delete_doc": ("POST", "/list/delete_doc"),
-    # move 端点尚未经真机验证（返回 illegal request），保留原推测值，待抓包确认
-    "move": ("POST", "/list/move"),
+    # move 端点已抓包确认（2026-08-04）：真实为 /list/custom/drag，旧推测的
+    # /list/move 实测返回 code 17 illegal request。body 见 client.move()。
+    "move": ("POST", "/list/custom/drag"),
 }
 
 # 网络重试配置（T5）

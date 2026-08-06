@@ -58,6 +58,8 @@ def main() -> None:
     list_parser = subparsers.add_parser("list", help="获取文档列表")
     list_parser.add_argument("--folder", default="0", help="文件夹ID")
     list_parser.add_argument("--json", action="store_true", help="JSON 格式输出")
+    list_parser.add_argument("--include-trash", action="store_true",
+                             help="包含已软删除（本地回收站）中的项")
 
     # 创建文件夹
     folder_parser = subparsers.add_parser("mkdir", help="创建文件夹")
@@ -92,10 +94,34 @@ def main() -> None:
     delete_parser.add_argument("--yes", action="store_true",
                                help="确认执行不可逆删除（必须显式传参）")
 
+    # 软删除恢复（v1.3.5）：仅移除本地标记，不调用服务端；零风险。
+    restore_parser = subparsers.add_parser(
+        "restore", help="从本地回收站恢复（仅移除标记，不调用服务端）"
+    )
+    restore_parser.add_argument("id", help="回收站项ID")
+
+    # 彻底删除（v1.3.5）：唯一不可逆操作，调用服务端 + 移除本地标记。
+    purge_parser = subparsers.add_parser(
+        "purge", help="彻底删除（不可逆，调用服务端 + 移除本地标记）"
+    )
+    purge_parser.add_argument("id", help="文档或文件夹ID")
+    purge_parser.add_argument("--type", choices=["doc", "folder"], default=None,
+                              help="对象类型（仅当回收站记录缺失时必填）："
+                                   "doc=文档 / folder=文件夹")
+    purge_parser.add_argument("--yes", action="store_true",
+                              help="确认执行不可逆彻底删除（必须显式传参）")
+
+    # 列出本地回收站（v1.3.5）
+    trash_parser = subparsers.add_parser(
+        "trash", help="列出本地回收站中已软删除的项"
+    )
+
     # 移动
-    move_parser = subparsers.add_parser("move", help="移动文档到其他文件夹")
-    move_parser.add_argument("item_id", help="文档ID")
+    move_parser = subparsers.add_parser("move", help="移动文档/文件夹到其他文件夹")
+    move_parser.add_argument("item_id", help="文档/文件夹 ID")
     move_parser.add_argument("--target", required=True, help="目标文件夹ID")
+    move_parser.add_argument("--type", default="doc", choices=["doc", "folder"],
+                             help="移动项类型（默认 doc）")
 
     # 搜索（T6，M4 T2 增加 --max-depth / --limit）
     search_parser = subparsers.add_parser("search", help="本地搜索文档/文件夹（按名称）")
@@ -105,6 +131,8 @@ def main() -> None:
     search_parser.add_argument("--limit", type=int, default=MAX_SEARCH_LIMIT,
                                help="返回结果上限（默认 50）")
     search_parser.add_argument("--json", action="store_true", help="JSON 格式输出")
+    search_parser.add_argument("--include-trash", action="store_true",
+                               help="包含已软删除（本地回收站）中的项")
 
     # 整树导出（Roadmap: 递归导出整个文件夹树为嵌套 Markdown）
     export_tree_parser = subparsers.add_parser(
@@ -120,7 +148,8 @@ def main() -> None:
     rename_parser.add_argument("id", help="文档或文件夹ID")
     rename_parser.add_argument("--name", required=True, help="新名称")
     rename_parser.add_argument("--type", choices=["doc", "folder"], default="doc",
-                               help="对象类型：doc=走 save_doc name；folder=走推测端点 /list/update_folder")
+                               help="对象类型：doc=走 save_doc name（⚠️ 真机受限）；"
+                                    "folder=走已验证端点 /list/rename_folder（folderId 填自身 id）")
 
     # OPML / FreeMind 导出（Roadmap: 兼容其它大纲工具）
     opml_parser = subparsers.add_parser("opml", help="将文档导出为 OPML / FreeMind XML")
@@ -155,7 +184,7 @@ def main() -> None:
             print(f"登录成功: {result['username']} (ID: {result['user_id']})")
 
         elif args.command == "list":
-            data = client.get_list(args.folder)
+            data = client.get_list(args.folder, include_trashed=args.include_trash)
             if args.json:
                 print(json.dumps(data, indent=2, ensure_ascii=False))
             else:
@@ -169,7 +198,11 @@ def main() -> None:
             md_path = getattr(args, "md", None)
             if md_path:
                 safe = _safe_local_path(md_path)
-                content = json.dumps(markdown_to_doc(safe.read_text(encoding="utf-8")), ensure_ascii=False)
+                # create_doc 的 content 同样是 definition JSON 字符串 {"nodes":[...]}，
+                # 与 get_doc 返回的 nodes 同构；markdown_to_doc 返回 {"node":{...}}，
+                # 此处取其根节点包成单顶层节点的 definition。
+                md_doc = markdown_to_doc(safe.read_text(encoding="utf-8"))
+                content = json.dumps({"nodes": [md_doc.get("node")]}, ensure_ascii=False)
             else:
                 content = args.content
             doc_id = client.create_doc(args.name, args.folder, content)
@@ -187,32 +220,68 @@ def main() -> None:
             file_path = args.file
             if md_path:
                 safe = _safe_local_path(md_path)
-                content = json.dumps(markdown_to_doc(safe.read_text(encoding="utf-8")), ensure_ascii=False)
+                # markdown_to_doc 返回 {"node":{...}}，取其根节点包成单顶层节点的
+                # definition（{"nodes":[...]}），与 get_doc 返回的 nodes 同构。
+                md_doc = markdown_to_doc(safe.read_text(encoding="utf-8"))
+                new_def = {"nodes": [md_doc.get("node")]}
             elif file_path:
                 safe = _safe_local_path(file_path)
-                content = safe.read_text(encoding="utf-8")
+                # 文件内容须为 definition JSON（{"nodes":[...]}）
+                new_def = json.loads(safe.read_text(encoding="utf-8"))
             elif args.content:
-                content = args.content
+                new_def = json.loads(args.content)
             else:
-                content = sys.stdin.read()
-            client.save_doc(args.doc_id, content)
+                new_def = json.loads(sys.stdin.read())
+            # 以新 definition 全量覆盖写回（事件契约见 client.build_update_event）
+            event = client.build_update_event(new_def, args.doc_id)
+            client.save_doc(args.doc_id, events=[event])
             print("保存成功")
 
         elif args.command == "delete":
-            # Medium×3 修复：delete 为不可逆操作，CLI 层守卫。
-            # 未显式传 --yes 时，打印不可逆警示并 sys.exit(1) 中止，
-            # 绝不调用 client.delete(...)；仅当 args.yes 为真才执行删除。
+            # v1.3.5：delete 改为「软删除」——仅移入本地回收站，云端副本仍在，
+            # 可用 restore 恢复、purge 彻底删除。依旧需要显式 --yes 守卫，
+            # 未传 --yes 时打印提示并 sys.exit(1) 中止，绝不写入回收站。
             if not args.yes:
                 logger.warning(
-                    "删除不可逆：即将删除幕布%s %s。确认请加 --yes 重新执行。",
+                    "移入本地回收站（云端仍在，可用 restore 恢复；purge 可彻底删除）："
+                    "即将软删除幕布%s %s。确认请加 --yes 重新执行。",
                     "文档" if args.type == "doc" else "文件夹", args.id,
                 )
                 sys.exit(1)
-            client.delete(args.id, args.type)
-            print("删除成功")
+            client.trash_item(args.id, args.type)
+            print(f"已移入本地回收站: {args.id}（restore 可恢复，purge 可彻底删除）")
+
+        elif args.command == "restore":
+            # 仅移除本地标记，零服务端调用（即便云端项已不存在也安全）。
+            ok = client.restore_item(args.id)
+            if ok:
+                print(f"已恢复: {args.id}")
+            else:
+                print(f"未找到回收站项: {args.id}")
+
+        elif args.command == "purge":
+            # 唯一不可逆操作：调用服务端真实删除 + 移除本地标记。
+            # 必须显式 --yes，否则 CLI 层中止。
+            if not args.yes:
+                logger.warning(
+                    "彻底删除不可逆：将调用服务端真实删除 %s，且不可恢复。"
+                    "确认请加 --yes 重新执行。", args.id,
+                )
+                sys.exit(1)
+            client.purge_item(args.id, item_type=args.type)
+            print(f"已彻底删除: {args.id}（不可恢复）")
+
+        elif args.command == "trash":
+            items = client.list_trash()
+            if not items:
+                print("回收站为空")
+            else:
+                for it in items:
+                    print(f"{it.get('id')} / {it.get('type')} / "
+                          f"{it.get('name')} / {it.get('deleted_at')}")
 
         elif args.command == "move":
-            client.move(args.item_id, args.target)
+            client.move(args.item_id, args.target, args.type)
             print(f"移动成功: {args.item_id} -> {args.target}")
 
         elif args.command == "search":
@@ -220,6 +289,7 @@ def main() -> None:
                 args.keyword,
                 max_depth=args.max_depth,
                 limit=args.limit,
+                include_trashed=args.include_trash,
             )
             results = result["results"]
             # 结果因达到上限被截断时，提示调用方结果可能不完整
@@ -246,7 +316,7 @@ def main() -> None:
             if args.type == "doc":
                 client.rename_doc(args.id, args.name)
             else:
-                # 文件夹重命名走逆向推测端点，真实环境需验证
+                # 文件夹重命名走已验证端点 /list/rename_folder（M12 真机验证）
                 client.rename_folder(args.id, args.name)
             print(f"重命名成功: {args.id} -> {args.name}")
 

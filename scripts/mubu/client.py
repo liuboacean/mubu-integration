@@ -4,6 +4,7 @@ import os
 import json
 import time
 import logging
+import uuid
 from pathlib import Path
 from typing import Optional, Dict, List, Any, Iterator
 
@@ -16,6 +17,7 @@ from mubu.config import (
     ENDPOINTS,
     ENV_FILE,
     TOKEN_FILE,
+    TRASH_FILE,
     REQUEST_TIMEOUT,
     MAX_NETWORK_RETRIES,
     NETWORK_BACKOFF,
@@ -43,10 +45,20 @@ class MubuClient:
         self.token = None
         self.user_id = None
         self.username = None
+        self.member_id = None  # v1.3.9：colla 会话 id，由 _load_token / 环境变量补全
         self.expires_at = 0  # Token 过期时间戳（秒）
         # P2 #22：复用 requests.Session 连接池，search 多请求场景下避免每次新建连接
         self._session = requests.Session()
-        self._load_token()
+        self._load_token()  # 先还原 token 缓存中的 member_id（若有）
+        # v1.3.9：memberId 为幕布 colla（协同）命名空间下的每账号会话 id，
+        # 既非登录 id 也非 JWT sub，无法经任何 API 反查；来源优先级：
+        # 环境变量 MUBU_MEMBER_ID（~/.workbuddy/.env.mubu）> token 缓存兜底。
+        if not self.member_id:
+            self.member_id = os.getenv("MUBU_MEMBER_ID")
+        # 排障手 move-sign 第 1 步：模拟浏览器 window.uniqueId / 会话的稳定标识，
+        # 整个客户端生命周期内不变，用于对齐网页端请求头以平抑 code:17（真机待验证）。
+        self._client_unique_id = str(uuid.uuid4())
+        self._session_id = str(uuid.uuid4())
 
     def _load_env_file(self, path: Optional[Path] = None) -> None:
         """从 .env 文件加载凭据（仅当环境变量未设置时补全）。
@@ -77,7 +89,7 @@ class MubuClient:
                 key = key.strip()
                 value = value.strip().strip('"').strip("'")
                 # 仅在环境变量未设置时补全
-                if key in ("MUBU_PHONE", "MUBU_PASSWORD") and not os.getenv(key):
+                if key in ("MUBU_PHONE", "MUBU_PASSWORD", "MUBU_MEMBER_ID") and not os.getenv(key):
                     os.environ[key] = value
         except Exception:
             # 加载失败不影响主流程，后续 login 会提示设置环境变量
@@ -93,6 +105,7 @@ class MubuClient:
                     self.token = data.get("token")
                     self.user_id = data.get("user_id")
                     self.username = data.get("username")
+                    self.member_id = data.get("member_id")
                     self.expires_at = expires_at
                     return True
             except Exception:
@@ -110,6 +123,7 @@ class MubuClient:
             "token": self.token,
             "user_id": self.user_id,
             "username": self.username,
+            "member_id": self.member_id,
             "expires_at": self.expires_at
         }
         with _token_file_lock():
@@ -120,10 +134,24 @@ class MubuClient:
             os.chmod(TOKEN_FILE, TOKEN_FILE_MODE)
 
     def _get_headers(self) -> Dict[str, str]:
-        """获取带认证的请求头"""
+        """获取带认证的请求头。
+
+        在 DEFAULT_HEADERS 基础上补 4 个「浏览器同款」头，对齐网页版 mubu 前端
+        的请求出口（app.js 模块 15224 的 axios 封装，并经 2026-08-04 抓包复核）：
+        data-unique-id / x-session-id / x-reg-entrance / x-request-id。
+        - data-unique-id：客户端生命周期内稳定 uuid4（__init__ 生成）。
+        - x-session-id：``{uuid}:{epoch秒}`` 格式（前缀稳定，后缀每次请求刷新）。
+        - x-reg-entrance：固定 ``https://mubu.com/app``。
+        - x-request-id：每次请求重新生成 uuid4。
+        Jwt-Token 原有逻辑不变。
+        """
         headers = DEFAULT_HEADERS.copy()
         if self.token:
-            headers["jwt-token"] = self.token
+            headers["Jwt-Token"] = self.token
+        headers["data-unique-id"] = self._client_unique_id
+        headers["x-session-id"] = f"{self._session_id}:{int(time.time())}"
+        headers["x-reg-entrance"] = "https://mubu.com/app"
+        headers["x-request-id"] = str(uuid.uuid4())
         return headers
 
     def ensure_valid_token(self) -> None:
@@ -306,9 +334,29 @@ class MubuClient:
         if not self.token:
             self.login()
 
-    def get_list(self, folder_id: str = "0") -> List[Dict]:
-        """获取文件夹下的文档和子文件夹列表"""
+    def get_list(self, folder_id: str = "0",
+                 include_trashed: bool = False) -> List[Dict]:
+        """获取文件夹下的文档和子文件夹列表。
+
+        Args:
+            folder_id: 文件夹 ID（默认 "0" 为根）
+            include_trashed: 为 False 时过滤掉已软删除（回收站）中的项；
+                为 True 时保留。软删除不影响云端，仅本地标记过滤。
+        """
         data = self._request(*ENDPOINTS["list"], json={"folderId": folder_id})
+        if not include_trashed:
+            trash = self._load_trash()
+            if trash:
+                # 文件夹：直接过滤
+                folders = data.get("folders", []) or []
+                data["folders"] = [f for f in folders if f.get("id") not in trash]
+                # 文档：保留接口实际返回的 key（真机返回 documents，旧兜底 docs）
+                if "documents" in data:
+                    docs = data.get("documents") or []
+                    data["documents"] = [d for d in docs if d.get("id") not in trash]
+                elif "docs" in data:
+                    docs = data.get("docs") or []
+                    data["docs"] = [d for d in docs if d.get("id") not in trash]
         return data
 
     def create_folder(self, name: str, parent_id: str = "0") -> str:
@@ -329,15 +377,95 @@ class MubuClient:
         return data.get("doc", {}).get("id", "")
 
     def get_doc(self, doc_id: str) -> Dict:
-        """获取文档内容"""
-        return self._request(*ENDPOINTS["get_doc"], json={"id": doc_id})
+        """获取文档内容（正文大纲）。返回 {"name":..., "nodes":[...]}。"""
+        self.ensure_login()
+        data = self._request(*ENDPOINTS["get_doc"], json={
+            "docId": doc_id,
+            "password": "",
+            "isFromDocDir": True,
+        })
+        # 真实响应：data.definition 是 JSON 字符串，需二次解析为 {"nodes":[...]}
+        definition = json.loads(data["definition"])
+        return {"name": data.get("name"), "nodes": definition.get("nodes", [])}
 
-    def save_doc(self, doc_id: str, content: str, name: Optional[str] = None) -> None:
-        """保存文档"""
-        data = {"id": doc_id, "content": content}
+    def build_update_event(self, doc_definition: Dict, doc_id: str) -> Dict:
+        """构建 colla/events 的单个 ``update`` 事件：以当前内容幂等覆盖当前内容。
+
+        形状（逆向自网页端 DocEditor chunk ``ti()`` 序列化器，2026-08-04 抓包复核）：
+            ``{"name": "update",
+                "updated": [{"updated": <rootNode>, "original": <rootNode>}]}``
+
+        - ``rootNode`` 为文档根节点：``id = doc_id``，``children = 顶层 nodes``。
+        - ``updated`` 与 ``original`` 同构 ⇒ 服务端视作无结构变化的幂等写回
+          （内容不变），对应网页端「保存当前大纲」的 changeset。
+        - 真实的节点序列化（含 ``children`` 递归、``text``/``note`` 字符串透传）
+          由网页端 ``tr()`` 完成；此处给出的 node 已是符合服务端契约的纯 dict，
+          直接作为 ``updated``/``original`` 负载即可。
+
+        Args:
+            doc_definition: 文档 definition（``json.loads(get_doc 的 definition)``），
+                形如 ``{"nodes": [...]}``。
+            doc_id: 文档 ID（作为 rootNode 的 id）。
+        """
+        nodes = doc_definition.get("nodes", []) if isinstance(doc_definition, dict) else []
+        root = {"id": doc_id, "children": nodes, "modified": int(time.time() * 1000)}
+        return {"name": "update", "updated": [{"updated": root, "original": root}]}
+
+    def save_doc(self, doc_id: str, events: Optional[List[Dict]] = None,
+                 version: Optional[int] = None, name: Optional[str] = None) -> None:
+        """通过 colla/events 持久化文档变更（端点已 2026-08-04 真机验证）。
+
+        Args:
+            doc_id: 文档 ID
+            events: 预构建的 changeset 事件列表；每个元素是形如
+                ``{"name": "update", "updated": [{"updated": node, "original": node}]}``
+                的字典，或由 ``build_update_event`` 生成。也可为
+                ``{"name": "nameChanged", "changed": "新标题"}`` 等。
+                不传（None）则对当前文档内容做**幂等全量回写**（touch，内容不变）。
+            version: 文档版本号（= get_doc 返回的 ``baseVersion``）。
+                不传则自动拉取当前文档以取得版本与（按需）内容。
+            name: 可选，随本次保存一并改文档名（追加一个 ``nameChanged`` 事件）。
+
+        真机契约（逆向自网页端 DocEditor chunk ``ts()`` 构建器 + 抓包复核）：
+            POST /v3/api/colla/events
+            body = {
+              "memberId": <colla 会话 id>,
+              "type": "CHANGE",
+              "version": <baseVersion>,
+              "documentId": <doc_id>,
+              "events": [ ... ]
+            }
+        每文档 ``x-reg-entrance`` 必须为 ``https://mubu.com/app/edit/home/<doc_id>``，
+        与网页端编辑页一致（经 2026-08-04 抓包复核）。
+
+        ``name`` 参数：显式重命名走独立端点 ``/list/rename_doc``（见 ``rename_doc``），
+        不要把它塞进 colla/events 的 ``nameChanged`` 事件——该事件仅用于协同实时同步，
+        显式改名会被服务端拒绝 illegal request（已真机验证 2026-08-04）。
+        """
+        if version is None or events is None:
+            raw = self._request(*ENDPOINTS["get_doc"], json={
+                "docId": doc_id,
+                "password": "",
+                "isFromDocDir": True,
+            })
+            if version is None:
+                version = raw.get("baseVersion")
+            if events is None:
+                definition = json.loads(raw["definition"])
+                events = [self.build_update_event(definition, doc_id)]
+        payload = {
+            "memberId": self.member_id or "",
+            "type": "CHANGE",
+            "version": version,
+            "documentId": doc_id,
+            "events": events,
+        }
+        # 每文档独立设置 x-reg-entrance（覆盖 _get_headers 的固定值）
+        headers = {"x-reg-entrance": f"https://mubu.com/app/edit/home/{doc_id}"}
+        self._request(*ENDPOINTS["save_doc"], json=payload, headers=headers)
+        # 改名走独立端点（content 保存与改名是两个正交操作）
         if name:
-            data["name"] = name
-        self._request(*ENDPOINTS["save_doc"], json=data)
+            self.rename_doc(doc_id, name)
 
     def delete_folder(self, folder_id: str) -> None:
         """删除文件夹（已真机验证：POST /list/delete_folder，body {"id": ...}）。"""
@@ -348,30 +476,122 @@ class MubuClient:
         self._request(*ENDPOINTS["delete_doc"], json={"id": doc_id})
 
     def delete(self, item_id: str, item_type: str = "folder") -> None:
-        """删除文档或文件夹（按类型分发，默认 folder）。
+        """本地软删除（v1.3.6 对齐 CLI 语义）：仅将项标记入本地回收站，零网络调用。
 
-        兼容旧调用；新代码建议直接用 delete_folder / delete_doc。
+        与 v1.3.5 CLI `delete` 子命令及下方设计注释一致——仅本地标记，
+        云端副本仍在。真实硬删仅保留给 `purge_item`（由 CLI `purge --yes`
+        触发）。兼容旧调用；新代码建议直接用 `trash_item` / `purge_item`。
         """
-        if item_type == "doc":
+        self.trash_item(item_id, item_type)
+
+    # --------------------------------------------------------------------- #
+    # 软删除 / 本地回收站（v1.3.5）
+    # 设计：delete = 软删除（仅本地标记，云端仍在）；restore = 移除标记；
+    # purge = 唯一不可逆操作，调用真实删除 API 后移除标记。
+    # 回收站仅存元数据快照作为安全网，不作为重建来源。
+    # --------------------------------------------------------------------- #
+    def _load_trash(self) -> Dict[str, Any]:
+        """读取本地回收站快照；文件缺失或损坏返回 {}。"""
+        if TRASH_FILE.exists():
+            try:
+                return json.loads(TRASH_FILE.read_text(encoding="utf-8")) or {}
+            except Exception:
+                return {}
+        return {}
+
+    def _save_trash(self, trash: Dict) -> None:
+        """原子写回收站快照：tmp → rename → chmod 600，整体置于文件锁内。"""
+        with _token_file_lock():
+            tmp = TRASH_FILE.parent / (TRASH_FILE.name + ".tmp")
+            tmp.write_text(json.dumps(trash, ensure_ascii=False, indent=2),
+                           encoding="utf-8")
+            os.rename(tmp, TRASH_FILE)
+            os.chmod(TRASH_FILE, TOKEN_FILE_MODE)
+
+    def trash_item(self, item_id: str, item_type: str,
+                   name: str = "", parent_id: str = "0") -> None:
+        """软删除：把项标记进本地回收站，零服务端调用（云端仍在）。"""
+        trash = self._load_trash()
+        trash[item_id] = {
+            "id": item_id,
+            "type": item_type,
+            "name": name,
+            "parent_id": parent_id,
+            "deleted_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        }
+        self._save_trash(trash)
+
+    def restore_item(self, item_id: str) -> bool:
+        """恢复：仅移除本地标记，零服务端调用。成功返回 True，未找到返回 False。"""
+        trash = self._load_trash()
+        if item_id in trash:
+            trash.pop(item_id)
+            self._save_trash(trash)
+            return True
+        return False
+
+    def purge_item(self, item_id: str, item_type: Optional[str] = None) -> None:
+        """彻底删除：唯一不可逆操作。
+
+        优先从回收站快照读取 item_type；若回收站记录缺失且调用方未显式
+        指定 item_type，**不默认 folder**，而是抛出明确错误要求显式指定，
+        杜绝把 doc 当 folder 误删（``/list/delete_folder`` 端点与文档 id 不匹配）。
+        调用方须已通过 CLI --yes 守卫确认。
+        """
+        trash = self._load_trash()
+        item = trash.get(item_id)
+        # 优先回收站记录；缺失时回退到调用方显式传入的 item_type
+        resolved_type = (item or {}).get("type") if item else item_type
+        if resolved_type not in ("doc", "folder"):
+            raise MubuError(
+                f"无法确定 {item_id} 的类型以执行彻底删除：回收站记录缺失且未显式"
+                f"指定 --type（doc/folder）。请使用 purge <id> --type <doc|folder> --yes "
+                f"显式指定后再执行，避免误删。"
+            )
+        if resolved_type == "doc":
             self.delete_doc(item_id)
         else:
             self.delete_folder(item_id)
+        if item_id in trash:
+            trash.pop(item_id)
+            self._save_trash(trash)
 
-    def move(self, item_id: str, target_folder_id: str) -> None:
-        """移动文档到其他文件夹"""
+    def list_trash(self) -> List[Dict]:
+        """列出回收站中所有已软删除的项（元数据快照）。"""
+        return list(self._load_trash().values())
+
+    def is_trashed(self, item_id: str) -> bool:
+        """判断项是否已在本地回收站中。"""
+        return item_id in self._load_trash()
+
+    def move(self, item_id: str, target_folder_id: str, item_type: str = "doc") -> None:
+        """移动文档/文件夹到其他文件夹。
+
+        真实端点已抓包确认（2026-08-04）：``POST /list/custom/drag``（旧推测的
+        ``/list/move`` 真机返回 ``code:17 / illegal request``）。请求体形状：
+        ``{"dst": null, "src": [{"type": "doc"|"folder", "id": ...}],
+        "folderId": <目标文件夹ID>}``。
+        - ``dst``=null 表示追加到目标文件夹末尾（保留原顺序）。
+        - ``src`` 为待移动项数组，每项 ``{"type", "id"}``；``type`` 支持 ``"doc"``
+          / ``"folder"``。
+        - ``folderId`` 为目标文件夹 ID（根目录用 ``"0"``）。
+        """
         self._request(*ENDPOINTS["move"], json={
-            "id": item_id,
-            "folderId": target_folder_id
+            "dst": None,
+            "src": [{"type": item_type, "id": item_id}],
+            "folderId": target_folder_id,
         })
 
     def rename_doc(self, doc_id: str, new_name: str) -> None:
-        """重命名文档（基于现有 save_doc 的 name 参数）。
+        """重命名文档（真实端点 POST /list/rename_doc，2026-08-04 抓包复核）。
 
-        先拉取文档内容，再用 save_doc 回写并携带新名称，实现 round-trip 重命名。
+        网页端重命名走独立 rename API，而非 colla/events 的 ``nameChanged`` 事件——
+        后者仅用于协同实时同步，显式重命名会被服务端拒绝 ``illegal request``
+        （已真机验证）。请求体形状：``{"documentId": <doc_id>, "name": <新名>}``
+        （注意字段是 ``documentId`` 不是 ``id``；``id`` 会返回 code 5 参数错误）。
+        成功响应为 ``{"version": <时间戳>}``。
         """
-        doc = self.get_doc(doc_id)
-        content = json.dumps(doc, ensure_ascii=False)
-        self.save_doc(doc_id, content, name=new_name)
+        self._request(*ENDPOINTS["rename_doc"], json={"documentId": doc_id, "name": new_name})
 
     def rename_folder(self, folder_id: str, new_name: str) -> None:
         """重命名文件夹（已真机验证：POST /list/rename_folder）。
@@ -436,7 +656,8 @@ class MubuClient:
     def search(self, keyword: str, root_folder_id: str = "0",
                max_depth: int = MAX_SEARCH_DEPTH,
                limit: int = MAX_SEARCH_LIMIT,
-               max_requests: int = MAX_SEARCH_REQUESTS) -> Dict[str, Any]:
+               max_requests: int = MAX_SEARCH_REQUESTS,
+               include_trashed: bool = False) -> Dict[str, Any]:
         """本地递归搜索：名称包含关键字的文档与文件夹（T6，M4 T2 增强）。
 
         mubu 无公开 /search 端点，从根文件夹开始递归遍历所有子文件夹，
@@ -469,6 +690,8 @@ class MubuClient:
         req_count = 0
         truncated = False
         visited: set = set()  # 已访问 folder_id，防环引用无限递归
+        # 软删除过滤集：含 include_trashed 时不加载（即不过滤）
+        trash = self._load_trash() if not include_trashed else {}
 
         def walk(folder_id: str, path: str, depth: int) -> None:
             nonlocal req_count, truncated
@@ -480,7 +703,7 @@ class MubuClient:
                     truncated = True
                 return
             try:
-                data = self.get_list(folder_id)
+                data = self.get_list(folder_id, include_trashed=include_trashed)
             except MubuError as e:
                 # 单个文件夹拉取失败不阻断整体遍历
                 logger.warning("遍历文件夹 %s 失败: %s", folder_id, e)
@@ -492,21 +715,29 @@ class MubuClient:
             folders = data.get("folders", []) or []
             docs = data.get("documents") or data.get("docs") or []
             for d in docs:
+                doc_id = d.get("id")
+                # 软删除项：除非显式 include_trashed，否则跳过
+                if not include_trashed and doc_id in trash:
+                    continue
                 name = d.get("name") or ""
                 if keyword_lower and keyword_lower in name.lower():
-                    results.append({"id": d.get("id"), "name": name, "type": "doc", "path": path})
+                    results.append({"id": doc_id, "name": name, "type": "doc", "path": path})
                     if len(results) >= limit:
                         truncated = True
                         return
             for f in folders:
+                fid = f.get("id")
+                # 软删除项：除非显式 include_trashed，否则跳过
+                if not include_trashed and fid in trash:
+                    continue
                 name = f.get("name") or ""
                 if keyword_lower and keyword_lower in name.lower():
-                    results.append({"id": f.get("id"), "name": name, "type": "folder", "path": path})
+                    results.append({"id": fid, "name": name, "type": "folder", "path": path})
                     if len(results) >= limit:
                         truncated = True
                         return
                 child_path = f"{path}/{name}" if path else name
-                walk(f.get("id"), child_path, depth + 1)
+                walk(fid, child_path, depth + 1)
 
         walk(root_folder_id, "", 0)
         return {

@@ -8,10 +8,12 @@ updates:
     # 仅提交更新 PR（SHA 钉死由人工 review 确认，避免自动改 SHA 引入供应链风险）
     open-pull-requests-limit: 10
 
-  # pip 依赖：每周检查并提交 requirements.txt 更新 PR
-  # （后续可在更新 PR 中启用 `pip install --require-hashes`）
+  # pip 依赖：本项目采用 pip-tools 范式（requirements.in → pip-compile 生成
+  # 带哈希的 requirements*.txt 锁文件）。Dependabot 直接改锁文件会丢失哈希、
+  # 与 pip-compile 冲突（2026-07-28 曾开 PR 改锁文件），故关闭其自动 PR，
+  # 依赖锁文件由维护者手动 pip-compile 更新（不阻断安全评估，仅改发布路径）。
   - package-ecosystem: "pip"
     directory: "/"
     schedule:
       interval: "weekly"
-    open-pull-requests-limit: 10
+    open-pull-requests-limit: 0

@@ -1,6 +1,6 @@
 ---
 name: mubu-integration
-description: 幕布笔记集成，支持登录认证、文档管理、文件夹操作、大纲导入/导出等功能。触发词：幕布、mubu、幕布大纲导入导出
+description: 幕布（mubu）与 Obsidian 集成：将幕布大纲导入 Obsidian、把 Markdown 同步到幕布、查询/导出幕布笔记。触发词：幕布、mubu、幕布导入 Obsidian、mubu 同步、幕布笔记导出
 ---
 
 # 幕布集成 Skill
@@ -9,10 +9,10 @@ description: 幕布笔记集成，支持登录认证、文档管理、文件夹�
 
 ## 权限与安全边界
 本 Skill 以你的幕布账号身份操作**远程真实内容**，使用前请知悉其权限边界：
-- **读取**：仅读取环境变量 `MUBU_PHONE` / `MUBU_PASSWORD`（环境变量未设置时，才由仓库外的 `~/.workbuddy/.env.mubu` 补全，且不写回其它位置）。
+- **读取**：仅读取环境变量 `MUBU_PHONE` / `MUBU_PASSWORD` / `MUBU_MEMBER_ID`（环境变量未设置时，才由仓库外的 `~/.workbuddy/.env.mubu` 补全；`MUBU_MEMBER_ID` 即幕布 colla 成员 ID，仅 `save` 写回需要，登录后自动缓存到 `~/.mubu_token`）。
 - **写入**：仅在本地写入 Token 缓存文件 `~/.mubu_token`（权限 `0o600` + 跨进程 `fcntl` 锁），不写入其它文件。
 - **网络**：仅访问 `api2.mubu.com`（base URL 可由 `MUBU_BASE_URL` 覆盖，但仅限 `mubu.com` 家族域名，防 MITM），**无第三方服务、无遥测、无数据外发**。
-- **破坏性操作需确认**：`save` / `move` / `delete` 会修改或删除你在幕布上的真实文档；其中 `delete` 为不可逆操作，CLI 必须显式传 `--yes` 才执行，否则中止并提示。
+- **写操作需确认**：真实会改动幕布内容的写操作为 `create`（新建）、`rename_folder`（重命名文件夹）、`save`（保存文档，端点 `/colla/events`，需 `member_id`）、`move`（移动，端点 `/list/custom/drag`）、`rename_doc`（文档重命名，端点 `/list/rename_doc`）、`purge`（彻底删除，唯一真实调用服务端删除，不可逆）；`delete` 现为**软删除**（仅标记进本地回收站，云端副本仍在）。`save` / `move` / `rename_doc` 已在 v1.3.9 经真机验证可用。所有真实写操作均需显式传 `--yes` 才执行，否则中止并提示。
 - **信任边界**：Skill 不读取你的其它本地文件、不执行与幕布无关的 shell 命令；它只做「登录 → 读写你的幕布文档」这一件事。
 
 ## 功能概览
@@ -24,17 +24,17 @@ description: 幕布笔记集成，支持登录认证、文档管理、文件夹�
 | 创建文件夹 | `POST /list/create_folder` | 在指定位置创建文件夹 |
 | 创建文档 | `POST /list/create_doc` | 创建新的大纲文档 |
 | 获取列表 | `POST /list/get` | 获取文件夹下的文档列表 |
-| 获取文档 | `POST /doc/get` | 获取文档详细内容 |
-| 更新文档 | `POST /doc/save` | 保存/更新文档内容 |
+| 获取文档 | `POST /document/edit/get` | 获取文档详细内容（真实端点；body 为 docId+password+isFromDocDir，返回 data.definition 为 JSON 字符串需二次解析） |
+| 更新文档 | `POST /colla/events` | 保存/更新文档内容（v1.3.9 起可用；colla 协同端点，`events` 承载 changeset；需 `member_id`，私人文档由 `MUBU_MEMBER_ID` 或 token 缓存提供）|
 | 删除文档 | `POST /list/delete_doc` | 删除文档（按类型区分端点） |
 | 删除文件夹 | `POST /list/delete_folder` | 删除文件夹（原 `/list/delete` 实测非法，已弃用） |
-| 移动文档 | `POST /list/move` | 移动文档到其他文件夹（⚠️ 端点未实测验证） |
+| 移动文档 | `POST /list/custom/drag` | 移动文档/文件夹到其他位置（v1.3.9 起可用；body `dst/src/folderId`，已真机验证）|
 | 导出 Markdown | 本地转换 | 将大纲结构转换为 Markdown |
 
 ## API 基础信息
 
 - **Base URL**: `https://api2.mubu.com/v3/api`
-- **认证方式**: JWT Token，通过请求头 `jwt-token` 传递
+- **认证方式**: JWT Token，通过请求头 `Jwt-Token` 传递
 - **Content-Type**: `application/json;charset=UTF-8`
 
 ## 环境变量配置
@@ -44,6 +44,8 @@ description: 幕布笔记集成，支持登录认证、文档管理、文件夹�
 ```bash
 export MUBU_PHONE="your_phone_number"    # 幕布账号手机号
 export MUBU_PASSWORD="your_password"      # 幕布账号密码
+# 可选：幕布 colla 成员 ID（仅 save 写回需要；登录后自动缓存到 ~/.mubu_token，一般无需手动设置）
+export MUBU_MEMBER_ID="your_collab_member_id"
 ```
 
 > 切勿在脚本或代码中硬编码明文密码；凭据仅通过环境变量或仓库外的
@@ -55,13 +57,13 @@ export MUBU_PASSWORD="your_password"      # 幕布账号密码
 
 ### 1. 使用 MubuClient
 
-所有操作都通过 `scripts/mubu_api.py` 中的 `MubuClient` 类完成（**不再有**独立的
+所有操作都通过 `scripts/mubu/client.py` 中的 `MubuClient` 类完成（`scripts/mubu_api.py` 仅为向后兼容的重新导出 shim，不再建议直接使用；**不再有**独立的
 `login()` / `create_folder()` / `create_doc()` / `get_list()` / `get_doc()` / `save_doc()` /
 `delete_item()` 模块级函数）。实例化时自动读取 `MUBU_PHONE` / `MUBU_PASSWORD`
 环境变量（或 `~/.workbuddy/.env.mubu`）并加载本地缓存 Token：
 
 ```python
-from scripts.mubu_api import MubuClient
+from mubu.client import MubuClient
 
 # 登录：凭据来自环境变量；返回扁平 data（token / id / name）
 client = MubuClient()
@@ -85,28 +87,31 @@ for r in results:
 
 ```json
 {
-  "node": {
-    "id": "root",
-    "text": "文档标题",
-    "children": [
-      {
-        "id": "node_1",
-        "text": "一级标题",
-        "children": [
-          {
-            "id": "node_1_1",
-            "text": "二级标题",
-            "children": []
-          }
-        ]
-      },
-      {
-        "id": "node_2",
-        "text": "另一个一级标题",
-        "children": []
-      }
-    ]
-  }
+  "name": "文档标题",
+  "nodes": [
+    {
+      "id": "node_1",
+      "text": "一级标题",
+      "children": [
+        {
+          "id": "node_1_1",
+          "text": "二级标题",
+          "children": []
+        }
+      ],
+      "collapsed": false,
+      "finish": false,
+      "modified": 0
+    },
+    {
+      "id": "node_2",
+      "text": "另一个一级标题",
+      "children": [],
+      "collapsed": false,
+      "finish": false,
+      "modified": 0
+    }
+  ]
 }
 ```
 
@@ -114,7 +119,7 @@ for r in results:
 
 ## Token 管理建议
 
-由于幕布的 Token 有效期限制（access_token 2小时，refresh_token 30天），建议：
+由于幕布的 access_token 仅约 2 小时有效（无 refresh_token 机制，代码也无任何 refresh 逻辑），建议：
 
 1. **本地缓存**: 将 Token 保存到本地文件（如 `~/.mubu_token`）
 2. **自动刷新**: 在 Token 快过期时自动刷新
@@ -209,17 +214,33 @@ def markdown_to_doc(md):
 | 命令 | 说明 |
 |------|------|
 | `login` | 手机号密码登录，Token 本地缓存 |
-| `list --folder <id>` | 获取文件夹下的文档/子文件夹列表（`--json` 输出原始 JSON） |
+| `list --folder <id> [--include-trash]` | 获取文件夹下的文档/子文件夹列表（`--json` 输出原始 JSON；`--include-trash` 包含已软删除项） |
 | `mkdir <name> --parent <id>` | 创建文件夹 |
 | `create <name> --folder <id> [--content <json>] [--md <file>]` | 创建文档；`--md` 从 Markdown 文件导入 |
 | `get <doc_id> [--export markdown\|json]` | 获取文档；`--export markdown` 输出真实 Markdown |
 | `save <doc_id> [--file <f>] [--md <file>] [--content <c>]` | 保存文档；`--md` 从 Markdown 文件导入 |
-| `delete <id> [--type doc\|folder] --yes` | 删除文档或文件夹（⚠️ 不可逆；`--type` 默认 folder，必须显式 `--yes` 才执行）|
-| `move <item_id> --target <folder_id>` | 移动文档到其他文件夹（⚠️ 该端点**尚未经真机验证**，可能返回 illegal request，慎用） |
-| `search <关键字> [--max-depth N] [--limit N]` | 按名称本地搜索文档/文件夹（递归遍历，大小写不敏感） |
+| `delete <id> [--type doc\|folder] --yes` | **软删除**：移入本地回收站（云端仍在，`restore` 可恢复，`purge` 可彻底删除）；`--type` 默认 folder，必须显式 `--yes` 才执行 |
+| `restore <id>` | 从本地回收站恢复（仅移除标记，零服务端调用） |
+| `purge <id> --yes` | **彻底删除（不可逆）**：调用服务端真实删除 API 后移除本地标记；必须显式 `--yes` 才执行 |
+| `trash` | 列出本地回收站中已软删除的项 |
+| `move <item_id> --target <folder_id> [--type doc\|folder]` | 移动文档/文件夹到其他位置（v1.3.9 起可用，端点 `/list/custom/drag`，已真机验证）|
+| `search <关键字> [--max-depth N] [--limit N] [--include-trash]` | 按名称本地搜索文档/文件夹（递归遍历，大小写不敏感；`--include-trash` 包含已软删除项） |
 | `export-tree --folder <id> [--output <dir>] [--max-depth N]` | 递归导出整个文件夹树为嵌套 Markdown 文件 |
-| `rename <id> --name <新名> [--type doc\|folder]` | 重命名文档（`save_doc` name）或文件夹（已验证端点 `/list/rename_folder`，`folderId` 填自身 id）|
+| `rename <id> --name <新名> [--type doc\|folder]` | 重命名文档（`/list/rename_doc` 端点）或文件夹（已验证端点 `/list/rename_folder`，`folderId` 填自身 id）|
 | `opml <doc_id> [--format opml\|freeplane]` | 导出为 OPML 2.0 / FreeMind XML（兼容 XMind 等其它大纲工具）|
+
+### 软删除 / 回收站（v1.3.5）
+
+`delete` 现在不再是真正的服务端删除，而是**软删除**：
+
+- `delete <id> [--type doc\|folder] --yes` —— **移入本地回收站**：仅把项的元数据标记进本地回收站文件 `~/.workbuddy/.mubu_trash.json`，**云端副本保持不变**，不调用任何删除 API。缺省（无 `--yes`）仅打印提示并退出，绝不软删除。
+- `restore <id>` —— 从本地回收站恢复：仅移除本地标记，**零服务端调用**（即使云端项已不存在也安全）。未找到该项时提示「未找到回收站项」。
+- `purge <id> --yes` —— **彻底删除（不可逆）**：唯一真正调用服务端删除 API（`delete_doc` / `delete_folder`）的操作，成功后移除本地标记。必须显式 `--yes`，否则中止。
+- `trash` —— 列出本地回收站中已软删除的项（id / type / name / deleted_at）。
+
+`list --include-trash` 与 `search <关键字> --include-trash` 可在列表中**包含**已软删除项（`get_list` / `search` 默认过滤回收站项）。
+
+> 回收站仅存元数据快照（id / type / name / parent_id / deleted_at），作为「云端仍在、可恢复」的安全网，**不作为重建来源**。
 
 Markdown 往返示例：
 
@@ -276,6 +297,8 @@ python3 scripts/mubu_api.py opml <doc_id> --format freeplane
 ```bash
 export MUBU_PHONE="你的手机号"
 export MUBU_PASSWORD="你的密码"
+# 可选：幕布 colla 成员 ID（仅 save 写回需要；登录后自动缓存到 ~/.mubu_token，一般无需手动设置）
+export MUBU_MEMBER_ID="你的幕布 colla 成员 ID"
 ```
 
 也可在 `~/.workbuddy/.env.mubu` 中配置（由 Skill 宿主加载为环境变量，且仅属主可读写）：
@@ -283,6 +306,8 @@ export MUBU_PASSWORD="你的密码"
 ```
 MUBU_PHONE=你的手机号
 MUBU_PASSWORD=你的密码
+# 可选：幕布 colla 成员 ID（仅 save 写回需要；登录后自动缓存，一般无需手动设置）
+MUBU_MEMBER_ID=你的幕布 colla 成员 ID
 ```
 
 ---
@@ -294,6 +319,7 @@ MUBU_PASSWORD=你的密码
 - 图片 / 附件类型节点不在本期 Markdown 往返范围内（会丢失媒体内容）。
 - 多个顶层标题导入时，首个为 root，其余作为 root 的 children；其后的列表项统一挂在
   root 下（规范未要求按标题再嵌套）。
+- `save`（文档保存）需要幕布 colla 成员 ID：私人文档的 `memberId` 任何 API 都不暴露，由 `MUBU_MEMBER_ID` 环境变量提供，或登录后随 Token 缓存写入 `~/.mubu_token`。缺失时会明确报错（不影响 `get` / `create` / `move` / `rename` 等其它操作）。v1.3.9 已修复 `save`（`/colla/events`）、`move`（`/list/custom/drag`）、doc `rename`（`/list/rename_doc`）的真机可用性。
 
 ---
 
@@ -308,7 +334,7 @@ MUBU_PASSWORD=你的密码
 
 ## Agent 使用指引
 
-当用户提到幕布、mubu 相关操作（如登录、文档/文件夹管理、大纲导入导出）时，使用本 Skill 的脚本完成操作。
+当用户提到幕布、mubu 相关操作（如将幕布大纲导入 Obsidian、把 Markdown 同步到幕布、查询/导出幕布笔记）时，使用本 Skill 的脚本完成操作。
 
 ### 前置检查
 
@@ -344,8 +370,12 @@ MUBU_PASSWORD=你的密码
 | 从 Markdown 保存文档 | `python3 scripts/mubu_api.py save <doc_id> --md outline.md` |
 | 从文件保存文档 | `python3 scripts/mubu_api.py save <doc_id> --file content.json` |
 | 移动文档 | `python3 scripts/mubu_api.py move <doc_id> --target <folder_id>` |
-| 删除文档/文件夹 | `python3 scripts/mubu_api.py delete <id> --type doc\|folder --yes`（⚠️ 删除不可逆，必须显式 `--yes`；`--type` 默认 folder）|
+| 软删除（移入回收站） | `python3 scripts/mubu_api.py delete <id> --type doc\|folder --yes`（云端仍在，`restore` 可恢复）|
+| 从回收站恢复 | `python3 scripts/mubu_api.py restore <id>` |
+| 彻底删除（不可逆） | `python3 scripts/mubu_api.py purge <id> --yes`（必须显式 `--yes`，调用服务端真实删除）|
+| 查看回收站 | `python3 scripts/mubu_api.py trash` |
 | 按名称搜索 | `python3 scripts/mubu_api.py search <关键字> [--max-depth N] [--limit N]` |
+| 按名称搜索（含回收站） | `python3 scripts/mubu_api.py search <关键字> [--max-depth N] [--limit N] --include-trash` |
 | 按名称搜索（JSON） | `python3 scripts/mubu_api.py search <关键字> [--max-depth N] [--limit N] --json` |
 
 ### 典型工作流
