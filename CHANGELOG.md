@@ -2,6 +2,13 @@
 
 记录 mubu-integration Skill 的里程碑演化。
 
+## v1.3.12（本期发布版本 · P0 落地页，2026-08-06）
+
+- **README 落地页化**：英文 `README.md` 重写为产品落地页（social-preview 头图、`assets/demo.gif` 动图、能力对比表、3 个 Use Case、Reliability 章节）；新增 `README.zh-CN.md` 全量中文版（英文默认 + 中文全量）。
+- **视觉资产**：新增 `assets/social-preview.png` 与 `assets/demo.gif`；配套 `demo.vhs` 录制脚本与 `scripts/gen_assets.py`。
+- **GitHub 仓库元数据重构**：描述 / homepage / topics 更新为 **AI Agent Skill** 定位，新增 20 个 topics（如 `ai-agent`、`claude-code`、`knowledge-management`、`outliner`）。
+- 版本号 `1.3.11 → 1.3.12`（满足 ClawHub 唯一版本号要求，避免重复版本被拒）。
+
 ## M1 (P0) — 基础能力
 - 登录（手机号密码 → JWT Token，请求头 `jwt-token`）
 - 文档/文件夹 CRUD：create_folder / create_doc / get_doc / save_doc / delete / move
