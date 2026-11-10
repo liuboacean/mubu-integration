@@ -256,7 +256,9 @@ def main() -> None:
             if ok:
                 print(f"已恢复: {args.id}")
             else:
+                # 未找到也必须非零退出，否则脚本/自动化无法察觉恢复失败。
                 print(f"未找到回收站项: {args.id}")
+                sys.exit(1)
 
         elif args.command == "purge":
             # 唯一不可逆操作：调用服务端真实删除 + 移除本地标记。
